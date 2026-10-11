@@ -1,4 +1,8 @@
+
 # SeaSail
+
+Preview:
+https://youtu.be/OqiDfUysCDo
 
 An endless ocean full of procedurally generated islands that you explore in a small fishing boat. It's written from scratch in **C++17 and OpenGL 3.3**, with no engine, no math library and no art assets: the terrain, waves, trees, buildings, boat and camera are all code. The handling and camera take their cue from *Dredge*.
 
