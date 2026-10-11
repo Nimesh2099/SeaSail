@@ -1,0 +1,45 @@
+# --- Build output -------------------------------------------------------------
+# CMake build folders (command line: build/, Visual Studio "Open Folder": out/)
+build/
+build-*/
+out/
+cmake-build-*/
+
+# Stray CMake files if someone configures in the source folder
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakeUserPresets.json
+_deps/
+
+# Compiled files
+*.exe
+*.obj
+*.o
+*.lib
+*.a
+*.dll
+*.so
+*.dylib
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.ipch
+
+# --- IDEs ---------------------------------------------------------------------
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln.docstates
+
+# --- Game output --------------------------------------------------------------
+# Screenshots taken with P (README images live in docs/ as .png)
+*.bmp
+
+# --- OS clutter ---------------------------------------------------------------
+Thumbs.db
+desktop.ini
+.DS_Store
