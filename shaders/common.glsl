@@ -91,15 +91,17 @@ float fogAmount(float dist)
 
 // A layer of clouds 1.2 km up. rgb = colour, a = coverage. Four octaves of
 // value noise drifting with the wind; lit from above by the sun or moon.
-vec4 clouds(vec3 rd)
+// `detail` = false skips the two finest octaves (using their average
+// instead), for reflections where the ripples hide fine detail anyway.
+vec4 clouds(vec3 rd, bool detail)
 {
     if (rd.y < 0.01) return vec4(0.0);
     float t = (1200.0 - uCamPos.y) / rd.y;
     vec2 p = uCamPos.xz + rd.xz * t + uOriginMod + uCloudOffset;
     float n = valueNoise(p / 512.0, 8.0) * 0.5
-            + valueNoise(p / 256.0, 16.0) * 0.25
-            + valueNoise(p / 128.0, 32.0) * 0.125
-            + valueNoise(p / 64.0, 64.0) * 0.0625;
+            + valueNoise(p / 256.0, 16.0) * 0.25;
+    n += detail ? valueNoise(p / 128.0, 32.0) * 0.125 + valueNoise(p / 64.0, 64.0) * 0.0625
+                : 0.5 * (0.125 + 0.0625);
     n /= 0.9375;
     float cover = smoothstep(0.52, 0.72, n);
     if (cover <= 0.0) return vec4(0.0);
@@ -116,11 +118,11 @@ vec4 clouds(vec3 rd)
     return vec4(col, a);
 }
 
-// Sky plus clouds, for the sky pass and for reflections in the water.
+// Sky plus clouds, as reflected in the water (coarse clouds).
 vec3 skyWithClouds(vec3 rd)
 {
     vec3 col = skyColor(rd);
-    vec4 c = clouds(rd);
+    vec4 c = clouds(rd, false);
     return mix(col, c.rgb, c.a);
 }
 

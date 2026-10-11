@@ -31,4 +31,20 @@ private:
     int w_ = 0, h_ = 0;
 };
 
+// ScreenTarget - an ordinary 8-bit colour + depth target. Used when the 3D
+// view renders below screen resolution (render scale < 1): the composite,
+// water and beams go here, then one pass stretches it over the screen.
+class ScreenTarget {
+public:
+    ~ScreenTarget() { destroy(); }
+    bool resize(int w, int h);
+    void bind() const;
+    GLuint colorTex() const { return color_; }
+
+private:
+    void destroy();
+    GLuint fbo_ = 0, color_ = 0, depth_ = 0;
+    int w_ = 0, h_ = 0;
+};
+
 } // namespace sea

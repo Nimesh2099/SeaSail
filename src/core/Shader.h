@@ -5,6 +5,7 @@
 #include "SeaMath.h"
 #include <glad/gl.h>
 #include <string>
+#include <unordered_map>
 
 namespace sea {
 
@@ -30,10 +31,13 @@ public:
     void setVec4Array(const char* name, const float* xyzw, int count) const;
 
 private:
-    GLint loc(const char* name) const { return glGetUniformLocation(program_, name); }
+    // Uniform locations are looked up once per name and cached: asking the
+    // driver by string every frame (hundreds of times) is surprisingly slow.
+    GLint loc(const char* name) const;
 
     std::string vertPath_, fragPath_;
     GLuint program_ = 0;
+    mutable std::unordered_map<std::string, GLint> locations_;
 };
 
 // Finds a file in "shaders/" next to the working dir or a few levels up,

@@ -76,7 +76,7 @@ public:
 
     // Draw all loaded chunks that touch the frustum. originX/Z is the world
     // position that local (camera-space) coordinates are measured from.
-    void draw(const Shader& shader, const Frustum& frustum, double originX, double originZ);
+    void draw(const Shader& shader, const Frustum& frustum, double originX, double originZ, const Vec3& camLocal);
 
     // Collect the props of every visible nearby chunk into `out`, with
     // positions relative to the floating origin.
@@ -140,6 +140,13 @@ private:
     std::vector<std::thread> workers_;
 
     ChunkStats stats_;
+
+    struct Visible {
+        float  dist2;
+        Vec3   offset;
+        Chunk* chunk;
+    };
+    std::vector<Visible> visible_;  // reused every frame by draw()
 };
 
 } // namespace sea

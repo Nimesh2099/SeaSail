@@ -22,6 +22,10 @@ const int MAX_WAKE = 64;
 uniform vec4 uWake[MAX_WAKE];
 uniform int  uWakeCount;
 uniform vec2 uBoatXZ;
+// The wake in groups of 8 segments: xy = centre, z = radius that holds the
+// group's foam. Pixels outside a group's circle skip its segments.
+const int WAKE_GROUP = 8;
+uniform vec4 uWakeGroups[MAX_WAKE / WAKE_GROUP];
 
 out vec4 fragColor;
 
@@ -34,6 +38,7 @@ vec3 waveNormal(vec2 p, float dist)
 {
     vec3 n = vec3(0.0, 1.0, 0.0);
     for (int i = 0; i < uWaveCount; ++i) {
+        if (dist > uWaveB[i].z) continue;   // ripple smaller than a pixel out here
         vec2  D = uWaveA[i].xy;
         float k = uWaveA[i].z;
         float A = uWaveA[i].w * (1.0 - smoothstep(0.5 * uWaveB[i].z, uWaveB[i].z, dist));
@@ -54,16 +59,22 @@ float wakeFoam(vec2 p)
 {
     if (uWakeCount < 2 || distance(p, uBoatXZ) > 180.0) return 0.0;
     float best = 1e9, bestAge = 0.0, bestStrength = 0.0;
-    for (int i = 0; i + 1 < uWakeCount; ++i) {
-        vec2 a = uWake[i].xy, b = uWake[i + 1].xy;
-        vec2 ab = b - a;
-        float t = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-4), 0.0, 1.0);
-        float d = length(p - (a + ab * t));
-        float age = mix(uWake[i].z, uWake[i + 1].z, t);
-        float strength = mix(uWake[i].w, uWake[i + 1].w, t);
-        float width = 1.0 + age * (0.35 + 0.8 * strength);
-        float m = d / width;
-        if (m < best) { best = m; bestAge = age; bestStrength = strength; }
+    int groups = (uWakeCount - 1 + WAKE_GROUP - 1) / WAKE_GROUP;
+    for (int g = 0; g < groups; ++g) {
+        vec4 G = uWakeGroups[g];
+        if (distance(p, G.xy) > G.z) continue;   // nowhere near this stretch of wake
+        int last = min(g * WAKE_GROUP + WAKE_GROUP, uWakeCount - 1);
+        for (int i = g * WAKE_GROUP; i < last; ++i) {
+            vec2 a = uWake[i].xy, b = uWake[i + 1].xy;
+            vec2 ab = b - a;
+            float t = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-4), 0.0, 1.0);
+            float d = length(p - (a + ab * t));
+            float age = mix(uWake[i].z, uWake[i + 1].z, t);
+            float strength = mix(uWake[i].w, uWake[i + 1].w, t);
+            float width = 1.0 + age * (0.35 + 0.8 * strength);
+            float m = d / width;
+            if (m < best) { best = m; bestAge = age; bestStrength = strength; }
+        }
     }
     if (best > 1.3) return 0.0;
     float life = 1.0 - bestAge / kWakeLife;
@@ -125,7 +136,9 @@ void main()
         float att = 1.0 / (1.0 + 0.004 * d * d);
         col += uPointColors[i].rgb * att * (pow(max(dot(R, l), 0.0), 300.0) * 3.0 + pow(max(dot(R, l), 0.0), 25.0) * 0.08);
     }
-    col += localLight(vWorld, N) * 0.12;
+    // One lamp evaluation shared by the water and its foam (both nearly face up).
+    vec3 lamps = localLight(vWorld, vec3(0.0, 1.0, 0.0));
+    col += lamps * 0.12;
 
     // ---- foam -------------------------------------------------------------------
     float pattern = 0.5 + 0.25 * sin(vBase.x * 1.7 + uTime * 1.3) * sin(vBase.y * 1.3 - uTime * 0.9)
@@ -141,7 +154,7 @@ void main()
     foam = max(foam, wake * smoothstep(0.15, 0.6, pattern + wake * 0.5));
 
     vec3 foamColor = vec3(0.92) * (uSunColor * uSunIntensity * max(uSunDir.y, 0.0) * 0.6 + skyColor(vec3(0, 1, 0)) * 0.6
-                                   + uMoonLight * 0.4 + localLight(vWorld, vec3(0, 1, 0)) * 0.8);
+                                   + uMoonLight * 0.4 + lamps * 0.8);
     col = mix(col, foamColor, clamp(foam, 0.0, 1.0));
 
     col = mix(col, fogColor(rd), fogAmount(waterDist));

@@ -1,3 +1,15 @@
+// windows.h first (for SetThreadPriority), so it defines APIENTRY before
+// glad sees it rather than redefining glad's.
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include "TerrainStreamer.h"
 
 #include "Frustum.h"
@@ -7,6 +19,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+
 
 namespace sea {
 
@@ -23,9 +36,11 @@ int cellsForLod(int lod) { return kChunkCells >> lod; }
 TerrainStreamer::TerrainStreamer(const IslandGenerator& terrain, int viewRadiusChunks)
     : terrain_(terrain), viewRadius_(viewRadiusChunks)
 {
-    // Leave a core for the main (render) thread.
+    // Leave the main (render) thread a core, and on bigger CPUs one more for
+    // the graphics driver's own thread. The workers also run at lower
+    // priority (see workerLoop), so streaming never steals frame time.
     unsigned hw = std::thread::hardware_concurrency();
-    unsigned n = hw > 2 ? hw - 1 : 2;
+    unsigned n = hw >= 6 ? hw - 2 : (hw > 2 ? hw - 1 : 2);
     if (n > 8) n = 8;
     for (unsigned i = 0; i < n; ++i) workers_.emplace_back(&TerrainStreamer::workerLoop, this);
 }
@@ -131,6 +146,10 @@ void TerrainStreamer::update(double camX, double camY, double camZ)
 
 void TerrainStreamer::workerLoop()
 {
+#ifdef _WIN32
+    // Background work: let the render thread win any contest for a core.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
     for (;;) {
         Job job;
         {
@@ -313,9 +332,13 @@ void TerrainStreamer::uploadFinished(double budgetMs)
     }
 }
 
-void TerrainStreamer::draw(const Shader& shader, const Frustum& frustum, double originX, double originZ)
+void TerrainStreamer::draw(const Shader& shader, const Frustum& frustum, double originX, double originZ,
+                           const Vec3& camLocal)
 {
     stats_ = {};
+    // Collect what's on screen, then draw nearest first: the depth test then
+    // rejects hidden ground before its (expensive) pixel shader runs.
+    visible_.clear();
     for (auto& kv : chunks_) {
         Chunk& c = kv.second;
         if (c.lod >= 0) ++stats_.loaded;
@@ -328,11 +351,18 @@ void TerrainStreamer::draw(const Shader& shader, const Frustum& frustum, double 
         Vec3 mx{offset.x + static_cast<float>(kChunkSize), c.maxH, offset.z + static_cast<float>(kChunkSize)};
         if (!frustum.intersectsBox(mn, mx)) continue;
 
-        shader.set("uChunkOffset", offset);
-        glBindVertexArray(c.vao);
-        glDrawElements(GL_TRIANGLES, c.indexCount, GL_UNSIGNED_SHORT, nullptr);
+        const float half = static_cast<float>(kChunkSize) * 0.5f;
+        float dx = offset.x + half - camLocal.x, dz = offset.z + half - camLocal.z;
+        visible_.push_back({dx * dx + dz * dz, offset, &c});
+    }
+    std::sort(visible_.begin(), visible_.end(), [](const Visible& a, const Visible& b) { return a.dist2 < b.dist2; });
+
+    for (const Visible& v : visible_) {
+        shader.set("uChunkOffset", v.offset);
+        glBindVertexArray(v.chunk->vao);
+        glDrawElements(GL_TRIANGLES, v.chunk->indexCount, GL_UNSIGNED_SHORT, nullptr);
         ++stats_.drawn;
-        stats_.triangles += static_cast<size_t>(c.indexCount) / 3;
+        stats_.triangles += static_cast<size_t>(v.chunk->indexCount) / 3;
     }
     {
         std::lock_guard<std::mutex> lock(queueMutex_);

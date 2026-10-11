@@ -34,6 +34,13 @@ void main()
     float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
     float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
 
+    // No real edge here (most of the screen): keep the pixel as it is and
+    // skip the four extra samples along the edge.
+    if (lMax - lMin < max(0.0312, lMax * 0.125)) {
+        fragColor = vec4(rgbM, 1.0);
+        return;
+    }
+
     // Edge direction (perpendicular to the brightness gradient).
     vec2 dir = vec2(-((lNW + lNE) - (lSW + lSE)), (lNW + lSW) - (lNE + lSE));
     float reduce = max((lNW + lNE + lSW + lSE) * 0.25 * (1.0 / 8.0), 1.0 / 128.0);

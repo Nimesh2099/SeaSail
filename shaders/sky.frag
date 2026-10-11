@@ -63,7 +63,7 @@ void main()
         float d = dot(rd, uSunDir);
         col += uSunColor * smoothstep(0.99965, 0.99985, d) * 25.0;
 
-        vec4 c = clouds(rd);
+        vec4 c = clouds(rd, true);
         col = mix(col, c.rgb, c.a);
     }
 

@@ -50,7 +50,8 @@ cmake --build build -j
 | **M** | minimap zoom (400 m / 1 km / 2.5 km) | **H** | hide HUD |
 | **F** | wireframe | **R** | hot-reload shaders |
 | **P** | screenshot (.bmp) | **Esc** | quit |
-| **`** or **F1** | developer console | | |
+| **`** or **F1** | developer console | **F3** | performance overlay |
+| **F11** or **Alt+Enter** | fullscreen | | |
 
 **HUD**:
 - **Minimap**, bottom left: a sea chart centred on your boat (the yellow arrow), with north up.
@@ -72,6 +73,7 @@ Press **`** (the key left of 1) or **F1** to open it. The game ignores the keybo
 | Time | `time [hh[:mm]]`, `pause [on\|off]`, `daylength [minutes]` |
 | Camera | `view chase\|side\|high\|low\|cove`, `freecam [on\|off]`, `fov [deg]`, `zoom [m]` |
 | Display | `hud`, `wireframe`, `lights`, `minimap [400\|1000\|2500]`, `reload`, `screenshot [file]`, `stats` |
+| Performance | `perf [on\|off\|report]`, `renderscale [0.25..1\|auto]`, `vsync [on\|off]`, `fullscreen [on\|off]` |
 | General | `help`, `clear`, `echo`, `exec <file>`, `quit` |
 
 - **Shortcuts**:
@@ -102,6 +104,9 @@ SeaSail --view high --simulate 20 --steer 0.3 --shot test.bmp
 SeaSail --cmd "tp island atoll; time 19"  # run console commands at start (repeatable)
 SeaSail --exec test.cfg                   # run a file of console commands at start
 SeaSail --console                         # start with the console open (also shows in --shot)
+SeaSail --fullscreen --scale 0.75         # fullscreen, 3D view at 75% resolution (default: auto)
+SeaSail --msaa 0                          # no MSAA on the window (cheaper on weak GPUs)
+SeaSail --shot out.bmp --bench 60         # time 60 frames and print GPU ms per render pass
 ```
 
 ---
@@ -165,6 +170,28 @@ Height is a pure function of world `(x, z)` in double precision. Nothing is stor
 - Text uses a public-domain 8×8 bitmap font (`Font8x8.h`), unpacked at start-up into a 128×48 texture atlas. Each character is one textured quad, and the whole console is two draw calls: panel shapes, then text. The scale is a whole number, so the pixels stay sharp.
 - Screenshots (`P` or `screenshot`) are saved after the scene and HUD are drawn but before the console, so it never ends up in the picture.
 
+### Performance (`Profiler.cpp`, F3)
+**F3** shows a frame-time graph and the time each part of the frame takes:
+- **CPU** sections are timed with `std::chrono`.
+- **GPU** passes use OpenGL timestamp queries. They're read back four frames later, so measuring never stalls the GPU.
+- Each line shows the average and the worst of the last 120 frames, so a stutter stands out as a high maximum even when the average is fine. `perf report` prints the same numbers in the console.
+
+What it led to, measured with `--bench` at 1080p (total GPU time down about 50%):
+- **Wake foam in groups**: the water shader used to test every pixel near the boat against 63 wake segments. The CPU now sends a bounding circle for each group of 8, so most pixels skip most groups.
+- **Skip what's too small to see**:
+  - Ripple waves are skipped where they're smaller than a pixel.
+  - The terrain's 1 m detail noise is skipped beyond 400 m, and rock strata only run on rock.
+  - Water reflections use 2 octaves of cloud noise instead of 4.
+- **Less overdraw**:
+  - Terrain chunks are drawn nearest first, so hidden ground fails the depth test before its pixel shader runs.
+  - The sky is drawn last on the far plane, so it only shades pixels nothing else covered.
+- **FXAA early-out**: pixels with no edge, which is most of them, skip the extra samples.
+- **Cached uniform locations**: they're looked up once per name, not hundreds of times a frame.
+- **Render scale**: the 3D view can render below screen resolution and is stretched back with a light sharpen.
+  - `auto` (the default) keeps it at 1080 lines or fewer, so a 1440p or 4K screen costs about what 1080p does. The HUD stays sharp at full resolution.
+- **Smoother streaming**: terrain worker threads run at below-normal priority and leave cores free for the render and driver threads.
+- **Fullscreen** (F11) uses the monitor's own mode, so frames go straight to the screen. On laptops with two GPUs, the game asks for the fast one (`NvOptimusEnablement`).
+
 ### Anti-aliasing
 The off-screen scene gets **FXAA** in the composite pass. For each pixel it finds the local edge direction from the brightness of the four diagonal neighbours, then blurs only along that edge.
 
@@ -209,17 +236,18 @@ GPU floats jitter a few km from (0, 0). Everything is therefore drawn relative t
   - It follows the boat with exponential smoothing and never dips below the waves or the ground.
 
 ### Rendering order (each frame)
-1. **HDR scene target**, where each pass writes colour plus camera distance:
-   - sky (with stars, moon and clouds)
-   - terrain chunks
+1. **HDR scene target** (at render scale), where each pass writes colour plus camera distance:
+   - terrain chunks, nearest first
    - instanced trees, rocks and gulls
    - lighthouses and jetties
    - the boat
-2. **Screen**: the scene is tone-mapped (ACES) and anti-aliased (FXAA) onto the screen.
+   - the sky last (with stars, moon and clouds), only where nothing else was drawn
+2. **Screen**: the scene is tone-mapped (ACES) and anti-aliased (FXAA). Below full resolution, this and the next two steps go to a low-res target instead.
 3. **Sea**: drawn on top, reading the scene's colour and distance to see through itself.
 4. **Lighthouse beams**: added on top.
-5. **HUD**.
-6. **Console**, if it's open (screenshots are taken just before this).
+5. **Upscale**: only when the render scale is below 1, the low-res view is stretched over the screen with a light sharpen.
+6. **HUD**, at full resolution.
+7. **Performance overlay and console**, if open (screenshots are taken just before this).
 
 ---
 
@@ -232,9 +260,9 @@ src/world/                IslandGenerator, TerrainStreamer, Ocean, Props (placem
 src/game/                 Boat (handling), BoatModel (procedural mesh), ChaseCamera, Environment (time of day)
 src/render/               Mesh (+builder), PropRenderer (instancing + plant models), LandmarkModels,
                           SceneTarget (HDR + distance), Frustum, Hud, Minimap, TextRenderer (+ Font8x8.h),
-                          ConsoleView
-shaders/                  sky, terrain, props, object, water, beam, composite (FXAA), hud, minimap, text
-                          + shared common.glsl
+                          ConsoleView, Profiler (CPU + GPU timers)
+shaders/                  sky, terrain, props, object, water, beam, composite (FXAA), upscale, hud, minimap,
+                          text + shared common.glsl
 external/glad/            OpenGL 3.3 core loader
 ```
 

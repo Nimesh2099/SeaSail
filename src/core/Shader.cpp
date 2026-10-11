@@ -122,7 +122,17 @@ bool Shader::reload()
 
     if (program_) glDeleteProgram(program_);
     program_ = prog;
+    locations_.clear();   // a new program has new locations
     return true;
+}
+
+GLint Shader::loc(const char* name) const
+{
+    auto it = locations_.find(name);
+    if (it != locations_.end()) return it->second;
+    GLint l = glGetUniformLocation(program_, name);
+    locations_.emplace(name, l);
+    return l;
 }
 
 void Shader::set(const char* name, float v) const { glUniform1f(loc(name), v); }

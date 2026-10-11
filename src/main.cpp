@@ -12,12 +12,15 @@
 //   F            wireframe                     R         reload shaders
 //   P            screenshot (.bmp)             Esc       quit
 //   ` or F1      developer console (type `help` in it)
+//   F3           performance overlay (CPU / GPU time per pass)
+//   F11 / Alt+Enter  fullscreen
 //
 // Command line (handy for testing and README images)
 //   SeaSail [--seed N] [--radius CHUNKS] [--width W --height H] [--hour 0..24]
 //           [--view chase|side|high|low|cove] [--simulate SECONDS] [--steer -1..1]
 //           [--island mountain|atoll|stacks|cay] [--time SECONDS] [--shot out.bmp]
 //           [--cmd "console commands"] [--exec file.cfg] [--console]
+//           [--fullscreen] [--scale 0.25..1] [--msaa 0|2|4|8] [--bench FRAMES]
 
 #include "Boat.h"
 #include "BoatModel.h"
@@ -33,6 +36,7 @@
 #include "Landmarks.h"
 #include "Mesh.h"
 #include "Minimap.h"
+#include "Profiler.h"
 #include "Ocean.h"
 #include "PropRenderer.h"
 #include "SceneTarget.h"
@@ -47,6 +51,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -58,6 +63,16 @@
 #include <vector>
 
 using namespace sea;
+
+#ifdef _WIN32
+// Laptops with two GPUs (NVIDIA Optimus, AMD switchable graphics) run new
+// programs on the slower built-in GPU unless the program asks otherwise.
+// Exporting these two variables is how a game asks for the fast one.
+extern "C" {
+__declspec(dllexport) unsigned long NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+#endif
 
 namespace {
 
@@ -77,6 +92,10 @@ struct Options {
     IslandType  island   = IslandType::Mountain;  // kind of island to start next to
     std::vector<std::string> startup;  // console lines to run at start ("exec file" for --exec)
     bool        console  = false;      // start with the console open
+    int         bench    = 0;          // with --shot: time this many frames and print a report
+    float       scale    = 0.0f;       // render scale, 0 = auto (at most 1080 lines)
+    bool        fullscreen = false;
+    int         msaa     = 4;          // samples for the window's own framebuffer (HUD edges)
 };
 
 Options parseArgs(int argc, char** argv)
@@ -97,6 +116,10 @@ Options parseArgs(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--cmd"))      o.startup.push_back(next());
         else if (!std::strcmp(argv[i], "--exec"))     o.startup.push_back(std::string("exec \"") + next() + "\"");
         else if (!std::strcmp(argv[i], "--console"))  o.console  = true;
+        else if (!std::strcmp(argv[i], "--bench"))    o.bench    = std::atoi(next());
+        else if (!std::strcmp(argv[i], "--scale"))    o.scale    = static_cast<float>(std::atof(next()));
+        else if (!std::strcmp(argv[i], "--fullscreen")) o.fullscreen = true;
+        else if (!std::strcmp(argv[i], "--msaa"))     o.msaa     = std::atoi(next());
         else if (!std::strcmp(argv[i], "--island")) {
             std::string t = next();
             o.island = t == "atoll" ? IslandType::Atoll : t == "stacks" ? IslandType::SeaStacks
@@ -104,6 +127,7 @@ Options parseArgs(int argc, char** argv)
         }
     }
     o.radius = std::max(8, std::min(o.radius, 64));
+    o.msaa   = std::max(0, std::min(o.msaa, 8));
     return o;
 }
 
@@ -134,14 +158,16 @@ struct App {
     std::unique_ptr<TerrainStreamer> terrain;
     std::unique_ptr<Ocean>           ocean;
     std::unique_ptr<SceneTarget>     scene;
+    std::unique_ptr<ScreenTarget>    lowRes;   // 3D view below screen resolution
     std::unique_ptr<Mesh>            boatMesh, lighthouseMesh, jettyMesh, hutMesh;
     std::unique_ptr<BeamMesh>        beamMesh;
     std::unique_ptr<PropRenderer>    props;
     std::unique_ptr<Hud>             hud;
     std::unique_ptr<Minimap>         minimap;
     std::unique_ptr<TextRenderer>    text;
+    std::unique_ptr<Profiler>        prof;
     std::unique_ptr<Shader> skyShader, terrainShader, objectShader, propShader, waterShader, compositeShader,
-                            beamShader, hudShader, minimapShader, textShader;
+                            beamShader, hudShader, minimapShader, textShader, upscaleShader;
     GLuint emptyVao = 0;
 
     Landmarks   landmarks;
@@ -153,6 +179,11 @@ struct App {
     Lights      lights;
     bool        freeCam = false;
     bool        boatLights = true;
+    bool        vsync = true;
+    float       renderScale = 0.0f;   // 0 = auto
+    int         renderW = 0, renderH = 0;  // what the 3D view was last drawn at
+    bool        fullscreen = false;
+    int         winX = 100, winY = 100, winW = 1280, winH = 720;  // windowed placement to go back to
     float       fogDensity = kDefaultFog;
     Console     console;
 
@@ -169,11 +200,14 @@ struct App {
     int    screenshotCount = 0;
     std::string pendingShot;            // save this file after the next frame is drawn
     float  fps = 0.0f;
+    bool   showPerf = false;            // F3 overlay
+    std::string gpuName;
 
     std::vector<Shader*> allShaders() const
     {
         return {skyShader.get(), terrainShader.get(), objectShader.get(), propShader.get(), waterShader.get(),
-                compositeShader.get(), beamShader.get(), hudShader.get(), minimapShader.get(), textShader.get()};
+                compositeShader.get(), beamShader.get(), hudShader.get(), minimapShader.get(), textShader.get(),
+                upscaleShader.get()};
     }
 };
 
@@ -274,6 +308,61 @@ void setMouseCapture(App& a, bool on)
 
 void onScroll(GLFWwindow*, double, double dy) { g_app->scrollAccum += static_cast<float>(dy); }
 
+// Render scale actually used: the setting, or in auto mode whatever keeps
+// the 3D view at 1080 lines or fewer (most of the GPU's work is per pixel,
+// and a 1440p or 4K screen has 1.8x or 4x the pixels of 1080p).
+float effectiveScale(const App& a, int fbH)
+{
+    if (a.renderScale > 0.0f) return a.renderScale;
+    if (fbH <= 1080) return 1.0f;
+    return std::floor(1080.0f / static_cast<float>(fbH) * 20.0f) / 20.0f;  // in 5% steps
+}
+
+void applyVsync(const App& a) { glfwSwapInterval(a.vsync ? 1 : 0); }
+
+// The monitor the window mostly sits on.
+GLFWmonitor* currentMonitor(GLFWwindow* w)
+{
+    int wx, wy, ww, wh;
+    glfwGetWindowPos(w, &wx, &wy);
+    glfwGetWindowSize(w, &ww, &wh);
+    int count = 0;
+    GLFWmonitor** monitors = glfwGetMonitors(&count);
+    GLFWmonitor* best = glfwGetPrimaryMonitor();
+    int bestArea = 0;
+    for (int i = 0; i < count; ++i) {
+        int mx, my;
+        glfwGetMonitorPos(monitors[i], &mx, &my);
+        const GLFWvidmode* m = glfwGetVideoMode(monitors[i]);
+        int ox = std::max(0, std::min(wx + ww, mx + m->width) - std::max(wx, mx));
+        int oy = std::max(0, std::min(wy + wh, my + m->height) - std::max(wy, my));
+        if (ox * oy > bestArea) {
+            bestArea = ox * oy;
+            best = monitors[i];
+        }
+    }
+    return best;
+}
+
+// Fullscreen at the monitor's own resolution and refresh rate. A real
+// fullscreen window lets the driver flip frames straight to the screen,
+// which paces frames more evenly than a maximised window.
+void setFullscreen(App& a, bool on)
+{
+    if (on == a.fullscreen) return;
+    if (on) {
+        glfwGetWindowPos(a.window, &a.winX, &a.winY);
+        glfwGetWindowSize(a.window, &a.winW, &a.winH);
+        GLFWmonitor* mon = currentMonitor(a.window);
+        const GLFWvidmode* mode = glfwGetVideoMode(mon);
+        glfwSetWindowMonitor(a.window, mon, 0, 0, mode->width, mode->height, mode->refreshRate);
+    } else {
+        glfwSetWindowMonitor(a.window, nullptr, a.winX, a.winY, a.winW, a.winH, 0);
+    }
+    a.fullscreen = on;
+    applyVsync(a);   // some drivers reset the swap interval on a mode change
+}
+
 // Open or close the console. The mouse is freed while it's open and put
 // back the way it was afterwards.
 void setConsoleOpen(App& a, bool open)
@@ -340,6 +429,10 @@ void consoleKey(App& a, int key, int mods)
 void onKey(GLFWwindow* w, int key, int, int action, int mods)
 {
     App& a = *g_app;
+    if (action == GLFW_PRESS && (key == GLFW_KEY_F11 || (key == GLFW_KEY_ENTER && (mods & GLFW_MOD_ALT)))) {
+        setFullscreen(a, !a.fullscreen);   // works with the console open too
+        return;
+    }
     // ` (the key left of 1) or F1 opens and closes the console.
     if (action == GLFW_PRESS && (key == GLFW_KEY_GRAVE_ACCENT || key == GLFW_KEY_F1)) {
         setConsoleOpen(a, !a.console.isOpen());
@@ -369,6 +462,7 @@ void onKey(GLFWwindow* w, int key, int, int action, int mods)
         std::printf("Shaders reloaded\n");
         break;
     case GLFW_KEY_P:         a.pendingShot = nextShotName(a); break;  // saved after the frame is drawn
+    case GLFW_KEY_F3:        a.showPerf = !a.showPerf; break;
     default: break;
     }
 }
@@ -604,6 +698,83 @@ void drawHud(App& a, int w, int h)
     hud.flush(*a.hudShader, w, h);
 }
 
+// printf into a std::string.
+std::string strf(const char* fmt, ...)
+{
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    return buf;
+}
+
+// Performance overlay (F3): frame-time graph plus where the time goes on
+// the CPU and on the GPU. "avg / max" is over the last 120 frames, so a
+// stutter shows up as a max far above the average.
+void drawPerf(App& a, int w, int h)
+{
+    const Profiler& p = *a.prof;
+    const int   ts   = std::max(2, h / 540);
+    const float lineH = static_cast<float>(10 * ts);
+    const float pad  = static_cast<float>(5 * ts);
+    const Rgba white{0.95f, 0.97f, 1.0f, 1.0f}, dim{0.65f, 0.72f, 0.78f, 1.0f}, head{0.52f, 0.86f, 1.0f, 1.0f};
+
+    std::vector<std::pair<std::string, Rgba>> lines;
+    auto line = [&](Rgba c, std::string t) { lines.emplace_back(std::move(t), c); };
+    line(head, strf("%s", a.gpuName.substr(0, 44).c_str()));
+    line(dim, strf("%dx%d  3D at %dx%d (%.0f%%%s)", w, h, a.renderW, a.renderH,
+                     100.0f * static_cast<float>(a.renderH) / static_cast<float>(std::max(h, 1)),
+                     a.renderScale > 0.0f ? "" : " auto"));
+    line(dim, strf("vsync %s  %s", a.vsync ? "on" : "off", a.fullscreen ? "fullscreen" : "windowed"));
+    float fps = p.frameAvg() > 0.0f ? 1000.0f / p.frameAvg() : 0.0f;
+    line(white, strf("%3.0f fps  frame %5.1f ms  worst %5.1f", fps, p.frameAvg(), p.frameMax()));
+    line(head, strf("CPU %5.2f ms         avg    max", p.cpuTotal()));
+    for (const Profiler::Section& s : p.cpuSections())
+        line(dim, strf("  %-16s %6.2f %6.2f", s.name.c_str(), s.avg(), s.max()));
+    if (p.gpuSupported()) {
+        line(head, strf("GPU %5.2f ms         avg    max", p.gpuTotal()));
+        for (const Profiler::Section& s : p.gpuSections())
+            line(dim, strf("  %-16s %6.2f %6.2f", s.name.c_str(), s.avg(), s.max()));
+    } else {
+        line(dim, "GPU timing not supported by this driver");
+    }
+
+    // Layout: a panel in the top-right corner, text then the graph.
+    size_t cols = 0;
+    for (const auto& l : lines) cols = std::max(cols, l.first.size());
+    const float graphH = static_cast<float>(40 * ts);
+    const float panelW = std::max(TextRenderer::width(cols, ts), static_cast<float>(Profiler::kGraph)) + 2.0f * pad;
+    const float panelH = lineH * static_cast<float>(lines.size()) + graphH + 3.0f * pad;
+    const float x0 = static_cast<float>(w) - panelW - pad, top = static_cast<float>(h) - pad;
+
+    Hud& hud = *a.hud;
+    TextRenderer& text = *a.text;
+    hud.begin();
+    text.begin();
+    hud.rect(x0, top - panelH, panelW, panelH, Rgba{0.02f, 0.05f, 0.07f, 0.82f});
+    for (size_t i = 0; i < lines.size(); ++i)
+        text.text(x0 + pad, top - pad - lineH * static_cast<float>(i + 1) + static_cast<float>(ts), lines[i].first, ts,
+                  lines[i].second);
+
+    // Frame-time graph, oldest on the left. 50 ms fills the height; lines at
+    // 16.7 ms (60 fps) and 33.3 ms (30 fps). Green / amber / red bars.
+    const float gx = x0 + pad, gy = top - panelH + pad, gw = panelW - 2.0f * pad;
+    const float bar = gw / static_cast<float>(Profiler::kGraph);
+    hud.rect(gx, gy, gw, graphH, Rgba{1, 1, 1, 0.05f});
+    for (int i = 0; i < Profiler::kGraph; ++i) {
+        float ms = p.frameTimes()[static_cast<size_t>((p.frameIndex() + i) % Profiler::kGraph)];
+        float bh = std::min(ms / 50.0f, 1.0f) * graphH;
+        Rgba c = ms < 18.0f ? Rgba{0.45f, 0.85f, 0.45f, 0.9f} : ms < 34.0f ? Rgba{1.0f, 0.75f, 0.3f, 0.9f}
+                                                                          : Rgba{1.0f, 0.35f, 0.3f, 0.95f};
+        hud.rect(gx + bar * static_cast<float>(i), gy, std::max(bar, 1.0f), bh, c);
+    }
+    for (float ms : {16.67f, 33.33f}) hud.rect(gx, gy + ms / 50.0f * graphH, gw, 1.0f, Rgba{1, 1, 1, 0.35f});
+
+    hud.flush(*a.hudShader, w, h);
+    text.flush(*a.textShader, w, h);
+}
+
 void drawLandmarks(App& a, const Frustum& frustum)
 {
     for (const Landmark& lm : a.landmarks.all()) {
@@ -647,19 +818,66 @@ void drawBeams(App& a, const Mat4& viewProj, int fbW, int fbH)
 
 void render(App& a, int fbW, int fbH)
 {
-    if (!a.scene->resize(fbW, fbH)) return;
+    // The 3D view may render below screen resolution (see effectiveScale);
+    // the HUD is always drawn at full resolution on top.
+    const float scale = effectiveScale(a, fbH);
+    const int rw = std::max(1, static_cast<int>(std::lround(static_cast<float>(fbW) * scale)));
+    const int rh = std::max(1, static_cast<int>(std::lround(static_cast<float>(fbH) * scale)));
+    const bool lowRes = rw != fbW || rh != fbH;
+    a.renderW = rw;
+    a.renderH = rh;
+    if (!a.scene->resize(rw, rh)) return;
+    if (lowRes && !a.lowRes->resize(rw, rh)) return;
     const float aspect = static_cast<float>(fbW) / static_cast<float>(fbH);
     Mat4 viewProj = Mat4::perspective(a.cam.fovY, aspect, 0.15f, 30000.0f) * a.cam.viewMatrix();
     Frustum frustum(viewProj);
     const GLenum fill = a.wireframe ? GL_LINE : GL_FILL;
     gatherLights(a);
 
+    Profiler& prof = *a.prof;
+
     // ---- pass 1: sky, terrain, plants, landmarks and the boat (HDR) -------------
     a.scene->bind();
     glClear(GL_DEPTH_BUFFER_BIT);
-    glDisable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
     glDisable(GL_CULL_FACE);
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    glPolygonMode(GL_FRONT_AND_BACK, fill);
+    prof.gpu("terrain");
+    a.terrainShader->use();
+    setCommonUniforms(*a.terrainShader, a);
+    a.terrainShader->set("uViewProj", viewProj);
+    a.terrainShader->set("uWireframe", a.wireframe ? 1 : 0);
+    a.terrain->draw(*a.terrainShader, frustum, a.originX, a.originZ, a.cam.position);
+
+    // Trees, rocks and gulls: one instanced draw per kind.
+    prof.cpu("cull props");
+    a.terrain->gatherProps(frustum, a.originX, a.originZ, a.cam.position, kPropFadeEnd, a.visibleProps);
+    a.landmarks.gulls(*a.world, camWorldX(a), camWorldZ(a), a.originX, a.originZ, a.time,
+                      a.visibleProps[static_cast<int>(PropType::Gull)]);
+    prof.cpu("draw calls");
+    prof.gpu("props");
+    a.propShader->use();
+    setCommonUniforms(*a.propShader, a);
+    a.propShader->set("uViewProj", viewProj);
+    a.propShader->set("uPropFadeStart", kPropFadeStart);
+    a.propShader->set("uPropFadeEnd", kPropFadeEnd);
+    a.props->draw(*a.propShader, a.visibleProps);
+
+    prof.gpu("objects");
+    a.objectShader->use();
+    setCommonUniforms(*a.objectShader, a);
+    a.objectShader->set("uViewProj", viewProj);
+    drawLandmarks(a, frustum);
+    a.objectShader->set("uModel", a.boat.transform(a.originX, a.originZ));
+    a.boatMesh->draw();
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+
+    // Sky last: it sits on the far plane, so with LEQUAL it only shades the
+    // pixels nothing else covered (no work behind islands and the boat).
+    prof.gpu("sky");
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_FALSE);
     glBindVertexArray(a.emptyVao);
     a.skyShader->use();
     setCommonUniforms(*a.skyShader, a);
@@ -669,38 +887,18 @@ void render(App& a, int fbW, int fbH)
     a.skyShader->set("uTanHalfFov", std::tan(a.cam.fovY * 0.5f));
     a.skyShader->set("uAspect", aspect);
     glDrawArrays(GL_TRIANGLES, 0, 3);
-
-    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
     glDepthMask(GL_TRUE);
-    glPolygonMode(GL_FRONT_AND_BACK, fill);
-    a.terrainShader->use();
-    setCommonUniforms(*a.terrainShader, a);
-    a.terrainShader->set("uViewProj", viewProj);
-    a.terrainShader->set("uWireframe", a.wireframe ? 1 : 0);
-    a.terrain->draw(*a.terrainShader, frustum, a.originX, a.originZ);
-
-    // Trees, rocks and gulls: one instanced draw per kind.
-    a.terrain->gatherProps(frustum, a.originX, a.originZ, a.cam.position, kPropFadeEnd, a.visibleProps);
-    a.landmarks.gulls(*a.world, camWorldX(a), camWorldZ(a), a.originX, a.originZ, a.time,
-                      a.visibleProps[static_cast<int>(PropType::Gull)]);
-    a.propShader->use();
-    setCommonUniforms(*a.propShader, a);
-    a.propShader->set("uViewProj", viewProj);
-    a.propShader->set("uPropFadeStart", kPropFadeStart);
-    a.propShader->set("uPropFadeEnd", kPropFadeEnd);
-    a.props->draw(*a.propShader, a.visibleProps);
-
-    a.objectShader->use();
-    setCommonUniforms(*a.objectShader, a);
-    a.objectShader->set("uViewProj", viewProj);
-    drawLandmarks(a, frustum);
-    a.objectShader->set("uModel", a.boat.transform(a.originX, a.originZ));
-    a.boatMesh->draw();
-    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 
     // ---- pass 2: tone-mapped, anti-aliased scene to the screen ------------------
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, fbW, fbH);
+    // (or to the low-res target, stretched over the screen after pass 4)
+    prof.gpu("composite");
+    if (lowRes) {
+        a.lowRes->bind();
+    } else {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, fbW, fbH);
+    }
     glClear(GL_DEPTH_BUFFER_BIT);
     glDisable(GL_DEPTH_TEST);
     glBindVertexArray(a.emptyVao);
@@ -709,10 +907,11 @@ void render(App& a, int fbW, int fbH)
     a.compositeShader->use();
     setCommonUniforms(*a.compositeShader, a);
     a.compositeShader->set("uScene", 0);
-    a.compositeShader->setVec2("uScreenSize", static_cast<float>(fbW), static_cast<float>(fbH));
+    a.compositeShader->setVec2("uScreenSize", static_cast<float>(rw), static_cast<float>(rh));
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
     // ---- pass 3: the sea, looking through itself at the scene -------------------
+    prof.gpu("water");
     glEnable(GL_DEPTH_TEST);
     glDepthMask(GL_TRUE);
     glActiveTexture(GL_TEXTURE1);
@@ -722,7 +921,7 @@ void render(App& a, int fbW, int fbH)
     a.ocean->setUniforms(*a.waterShader, a.originX, a.originZ, a.time);
     a.waterShader->set("uViewProj", viewProj);
     a.waterShader->setVec2("uCamXZ", a.cam.position.x, a.cam.position.z);
-    a.waterShader->setVec2("uScreenSize", static_cast<float>(fbW), static_cast<float>(fbH));
+    a.waterShader->setVec2("uScreenSize", static_cast<float>(rw), static_cast<float>(rh));
     a.waterShader->set("uScene", 0);
     a.waterShader->set("uSceneDistance", 1);
     a.waterShader->set("uWireframe", a.wireframe ? 1 : 0);
@@ -740,6 +939,25 @@ void render(App& a, int fbW, int fbH)
     }
     a.waterShader->setVec4Array("uWake", wake, std::max(nWake, 1));
     a.waterShader->set("uWakeCount", nWake);
+    // Bounding circles for groups of 8 segments, so most pixels can skip
+    // most of the wake (see wakeFoam in water.frag).
+    float groups[8 * 4] = {};
+    for (int g = 0; g * 8 < nWake - 1; ++g) {
+        int first = g * 8, last = std::min(first + 8, nWake - 1);  // points first..last
+        float cx = 0.0f, cz = 0.0f;
+        for (int i = first; i <= last; ++i) { cx += wake[i * 4 + 0]; cz += wake[i * 4 + 1]; }
+        cx /= static_cast<float>(last - first + 1);
+        cz /= static_cast<float>(last - first + 1);
+        float r = 0.0f;
+        for (int i = first; i <= last; ++i) {
+            float width = 1.0f + wake[i * 4 + 2] * (0.35f + 0.8f * wake[i * 4 + 3]);
+            r = std::max(r, std::hypot(wake[i * 4 + 0] - cx, wake[i * 4 + 1] - cz) + width * 1.3f + 0.5f);
+        }
+        groups[g * 4 + 0] = cx;
+        groups[g * 4 + 1] = cz;
+        groups[g * 4 + 2] = r;
+    }
+    a.waterShader->setVec4Array("uWakeGroups", groups, 8);
     Vec3 bl = boatLocal(a);
     a.waterShader->setVec2("uBoatXZ", bl.x, bl.z);
 
@@ -748,9 +966,25 @@ void render(App& a, int fbW, int fbH)
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 
     // ---- pass 4: lighthouse beams over everything ---------------------------------
-    drawBeams(a, viewProj, fbW, fbH);
+    prof.gpu("beams");
+    drawBeams(a, viewProj, rw, rh);
     glActiveTexture(GL_TEXTURE0);
 
+    if (lowRes) {
+        prof.gpu("upscale");
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, fbW, fbH);
+        glDisable(GL_DEPTH_TEST);
+        glBindVertexArray(a.emptyVao);
+        glBindTexture(GL_TEXTURE_2D, a.lowRes->colorTex());
+        a.upscaleShader->use();
+        a.upscaleShader->set("uSource", 0);
+        a.upscaleShader->setVec2("uSourceSize", static_cast<float>(rw), static_cast<float>(rh));
+        a.upscaleShader->set("uSharpen", clampf((1.0f - scale) * 1.2f, 0.0f, 0.5f));
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+
+    prof.gpu("hud");
     if (a.showHud) drawHud(a, fbW, fbH);
 }
 
@@ -764,6 +998,7 @@ void shutdown(App& a)
     a.world.reset();
     a.ocean.reset();
     a.scene.reset();
+    a.lowRes.reset();
     a.boatMesh.reset();
     a.lighthouseMesh.reset();
     a.jettyMesh.reset();
@@ -772,6 +1007,7 @@ void shutdown(App& a)
     a.props.reset();
     a.hud.reset();
     a.text.reset();
+    a.prof.reset();
     a.skyShader.reset();
     a.terrainShader.reset();
     a.objectShader.reset();
@@ -782,6 +1018,7 @@ void shutdown(App& a)
     a.hudShader.reset();
     a.minimapShader.reset();
     a.textShader.reset();
+    a.upscaleShader.reset();
     if (a.emptyVao) glDeleteVertexArrays(1, &a.emptyVao);
     glfwTerminate();
 }
@@ -798,7 +1035,8 @@ void printControls()
         "  Backspace  respawn by an island        N          new world\n"
         "  Tab        release/capture mouse       H          hide HUD       F  wireframe\n"
         "  R          reload shaders              P          screenshot     Esc  quit\n"
-        "  ` or F1    developer console (type help)\n\n");
+        "  ` or F1    developer console (type help)  F3         performance overlay\n"
+        "  F11        fullscreen (also Alt+Enter)\n\n");
 }
 
 float bearingDegrees(const Vec3& f)
@@ -1259,6 +1497,59 @@ void registerCommands(App& a)
         if (name.size() < 4 || Console::lower(name.substr(name.size() - 4)) != ".bmp") name += ".bmp";
         a.pendingShot = name;
     });
+    add("Display", "renderscale", "[0.25..1 | auto]", "draw the 3D view at a fraction of the screen resolution",
+        [&a](const ConsoleArgs& args) {
+            Console& c = a.console;
+            if (!args.empty()) {
+                if (Console::lower(args[0]) == "auto") {
+                    a.renderScale = 0.0f;
+                } else {
+                    float v;
+                    if (!c.number(args[0], v, "renderscale")) return;
+                    a.renderScale = clampf(v, 0.25f, 1.0f);
+                }
+            }
+            int fw, fh;
+            glfwGetFramebufferSize(a.window, &fw, &fh);
+            float sc = effectiveScale(a, fh);
+            c.print("renderscale %s: 3D view at %dx%d of %dx%d", a.renderScale > 0.0f ? strf("%.2f", sc).c_str()
+                    : strf("auto (%.2f)", sc).c_str(), static_cast<int>(std::lround(static_cast<float>(fw) * sc)),
+                    static_cast<int>(std::lround(static_cast<float>(fh) * sc)), fw, fh);
+        }, {"auto", "0.5", "0.75", "1"});
+    add("Display", "vsync", "[on|off]", "wait for the screen's refresh (no tearing)", [&a](const ConsoleArgs& args) {
+        bool on;
+        if (!a.console.onOff(args, a.vsync, on)) return;
+        a.vsync = on;
+        applyVsync(a);
+        a.console.print("vsync %s", on ? "on" : "off");
+    }, {"on", "off"});
+    add("Display", "fullscreen", "[on|off]", "fullscreen on the current monitor (F11 or Alt+Enter)",
+        [&a](const ConsoleArgs& args) {
+            bool on;
+            if (!a.console.onOff(args, a.fullscreen, on)) return;
+            setFullscreen(a, on);
+            a.console.print("fullscreen %s", on ? "on" : "off");
+        }, {"on", "off"});
+    add("Display", "perf", "[on|off|report]", "performance overlay (F3); report prints the numbers",
+        [&a](const ConsoleArgs& args) {
+            Console& c = a.console;
+            if (!args.empty() && Console::lower(args[0]) == "report") {
+                const Profiler& p = *a.prof;
+                c.heading("%s", a.gpuName.c_str());
+                c.print("frame %.2f ms avg, %.2f ms worst (last 4 s)", p.frameAvg(), p.frameMax());
+                c.print("CPU %.2f ms", p.cpuTotal());
+                for (const Profiler::Section& sct : p.cpuSections())
+                    c.print("  %-16s avg %6.2f  max %6.2f", sct.name.c_str(), sct.avg(), sct.max());
+                c.print("GPU %.2f ms", p.gpuTotal());
+                for (const Profiler::Section& sct : p.gpuSections())
+                    c.print("  %-16s avg %6.2f  max %6.2f", sct.name.c_str(), sct.avg(), sct.max());
+                return;
+            }
+            bool on;
+            if (!c.onOff(args, a.showPerf, on)) return;
+            a.showPerf = on;
+            c.print("perf %s", on ? "on" : "off");
+        }, {"on", "off", "report"});
     add("Display", "stats", "", "frame rate, terrain chunks, triangles, props", [&a](const ConsoleArgs&) {
         Console& c = a.console;
         const ChunkStats& st = a.terrain->stats();
@@ -1290,7 +1581,7 @@ int main(int argc, char** argv)
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
-    glfwWindowHint(GLFW_SAMPLES, 4);
+    glfwWindowHint(GLFW_SAMPLES, app.opt.msaa);
     const bool shotMode = !app.opt.shot.empty();
     if (shotMode) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
 
@@ -1301,7 +1592,11 @@ int main(int argc, char** argv)
         return 1;
     }
     glfwMakeContextCurrent(app.window);
-    glfwSwapInterval(1);
+    app.renderScale = app.opt.scale > 0.0f ? clampf(app.opt.scale, 0.25f, 1.0f) : 0.0f;
+    applyVsync(app);
+    glfwGetWindowPos(app.window, &app.winX, &app.winY);
+    glfwGetWindowSize(app.window, &app.winW, &app.winH);
+    if (app.opt.fullscreen && !shotMode) setFullscreen(app, true);
     glfwSetKeyCallback(app.window, onKey);
     glfwSetScrollCallback(app.window, onScroll);
     glfwSetCharCallback(app.window, onChar);
@@ -1326,6 +1621,7 @@ int main(int argc, char** argv)
     app.hudShader       = load("hud.vert", "hud.frag");
     app.minimapShader   = load("minimap.vert", "minimap.frag");
     app.textShader      = load("text.vert", "text.frag");
+    app.upscaleShader   = load("fullscreen.vert", "upscale.frag");
     for (Shader* s : app.allShaders()) {
         if (!s->valid()) {
             std::fprintf(stderr, "Shader setup failed (is the shaders/ folder next to the exe?)\n");
@@ -1337,9 +1633,12 @@ int main(int argc, char** argv)
 
     app.ocean = std::make_unique<Ocean>();
     app.scene = std::make_unique<SceneTarget>();
+    app.lowRes = std::make_unique<ScreenTarget>();
     app.hud   = std::make_unique<Hud>();
     app.minimap = std::make_unique<Minimap>();
     app.text    = std::make_unique<TextRenderer>();
+    app.prof    = std::make_unique<Profiler>();
+    app.gpuName = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
     app.props = std::make_unique<PropRenderer>();
     app.boatMesh       = buildMesh([](MeshBuilder& m) { buildBoatModel(m); });
     app.lighthouseMesh = buildMesh(buildLighthouse);
@@ -1404,7 +1703,31 @@ int main(int argc, char** argv)
 
         int fw, fh;
         glfwGetFramebufferSize(app.window, &fw, &fh);
+        if (app.opt.bench > 0) {
+            // Time the same view for N frames; GPU results arrive a few frames late.
+            Profiler& prof = *app.prof;
+            for (int i = 0; i < app.opt.bench + 8; ++i) {
+                prof.beginFrame();
+                prof.cpu("draw calls");
+                render(app, fw, fh);
+                prof.gpuEnd();
+                prof.cpuEnd();
+                glFinish();
+            }
+            std::printf("Bench %dx%d, %d frames on %s\n", fw, fh, app.opt.bench, app.gpuName.c_str());
+            float total = 0.0f;
+            for (const Profiler::Section& s : prof.gpuSections()) {
+                // Average over the frames actually measured (the ring holds 120).
+                float sum = 0.0f;
+                int n = std::min(app.opt.bench, Profiler::kHistory);
+                for (int k = 0; k < n; ++k) sum += s.ms[static_cast<size_t>((s.lastFrame - k + Profiler::kHistory * 4) % Profiler::kHistory)];
+                std::printf("  gpu %-12s %8.2f ms\n", s.name.c_str(), sum / static_cast<float>(n));
+                total += sum / static_cast<float>(n);
+            }
+            std::printf("  gpu %-12s %8.2f ms\n", "TOTAL", total);
+        }
         render(app, fw, fh);
+        if (app.showPerf) drawPerf(app, fw, fh);
         if (app.console.isOpen())
             drawConsole(app.console, *app.hud, *app.text, *app.hudShader, *app.textShader, fw, fh);
         glFinish();
@@ -1427,16 +1750,23 @@ int main(int argc, char** argv)
         float dt = static_cast<float>(std::min(now - last, 0.05));
         last = now;
 
+        Profiler& prof = *app.prof;
+        prof.beginFrame();
+        prof.cpu("input + sim");
         glfwPollEvents();
         update(app, dt);
+        prof.cpu("stream plan");
         app.terrain->update(camWorldX(app), app.cam.position.y, camWorldZ(app));
+        prof.cpu("stream upload");
         app.terrain->uploadFinished(3.0);  // ms per frame for GPU uploads
+        prof.cpu("landmarks+map");
         app.landmarks.update(*app.world, camWorldX(app), camWorldZ(app));
         app.minimap->update(*app.world, app.boat.x(), app.boat.z());
 
         int fw, fh;
         glfwGetFramebufferSize(app.window, &fw, &fh);
         if (fw > 0 && fh > 0) {
+            prof.cpu("draw calls");
             render(app, fw, fh);
             // Screenshots are taken here: a whole frame, before the console.
             if (!app.pendingShot.empty()) {
@@ -1444,8 +1774,13 @@ int main(int argc, char** argv)
                 else app.console.error("Could not write %s", app.pendingShot.c_str());
                 app.pendingShot.clear();
             }
+            prof.cpu("overlays");
+            prof.gpu("overlays");
+            if (app.showPerf) drawPerf(app, fw, fh);
             drawConsole(app.console, *app.hud, *app.text, *app.hudShader, *app.textShader, fw, fh);
         }
+        prof.gpuEnd();
+        prof.cpuEnd();   // the rest of the frame is waiting for vsync
         glfwSwapBuffers(app.window);
 
         ++frames;

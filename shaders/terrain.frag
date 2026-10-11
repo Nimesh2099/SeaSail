@@ -27,16 +27,21 @@ void main()
     vec2  p   = vWorld.xz + uOriginMod;
     float n16 = valueNoise(p / 16.0, 256.0);   // 16 m patches
     float n4  = valueNoise(p / 4.0, 1024.0);   //  4 m clumps
-    float n1  = valueNoise(p, 4096.0);         //  1 m grain
     float fade = 1.0 - smoothstep(60.0, 400.0, dist); // fine detail only up close
 
-    // Micro relief: tilt the normal by the slope of the 1 m noise.
+    // Micro relief: tilt the normal by the slope of the 1 m noise. Beyond
+    // 400 m it's smaller than a pixel, so skip the three extra noise lookups
+    // (whole screen regions take the same branch, so this is cheap on a GPU).
     vec3 N = normalize(vNormal);
-    float e = 0.25;
-    float nx = valueNoise((p + vec2(e, 0.0)), 4096.0) - n1;
-    float nz = valueNoise((p + vec2(0.0, e)), 4096.0) - n1;
-    // Only on gentle ground: on cliffs this xz noise would smear into streaks.
-    N = normalize(N + vec3(-nx, 0.0, -nz) * 1.6 * fade * smoothstep(0.6, 0.9, N.y));
+    float n1 = 0.5;
+    if (fade > 0.0) {
+        n1 = valueNoise(p, 4096.0);         //  1 m grain
+        float e = 0.25;
+        float nx = valueNoise((p + vec2(e, 0.0)), 4096.0) - n1;
+        float nz = valueNoise((p + vec2(0.0, e)), 4096.0) - n1;
+        // Only on gentle ground: on cliffs this xz noise would smear into streaks.
+        N = normalize(N + vec3(-nx, 0.0, -nz) * 1.6 * fade * smoothstep(0.6, 0.9, N.y));
+    }
 
     float h     = vWorld.y;
     float slope = 1.0 - normalize(vNormal).y;
@@ -66,9 +71,11 @@ void main()
                         smoothstep(130.0, 170.0, h));
     // On steep faces, take the noise from (along the face, up the face)
     // instead of (x, z), which would stretch into vertical streaks.
-    float nFace = valueNoise(vec2(p.x + p.y, h * 1.5) / 4.0, 1024.0);
-    vec3 strata = rock * (0.78 + 0.16 * sin(h * 1.7 + n4 * 3.0) + 0.22 * nFace);
-    c = mix(c, strata, rockAmt);
+    if (rockAmt > 0.0) {
+        float nFace = valueNoise(vec2(p.x + p.y, h * 1.5) / 4.0, 1024.0);
+        vec3 strata = rock * (0.78 + 0.16 * sin(h * 1.7 + n4 * 3.0) + 0.22 * nFace);
+        c = mix(c, strata, rockAmt);
+    }
     c *= mix(1.0, 0.85 + 0.3 * n1, fade);                           // grain
 
     // ---- lighting ------------------------------------------------------------
