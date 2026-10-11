@@ -50,6 +50,7 @@ cmake --build build -j
 | **M** | minimap zoom (400 m / 1 km / 2.5 km) | **H** | hide HUD |
 | **F** | wireframe | **R** | hot-reload shaders |
 | **P** | screenshot (.bmp) | **Esc** | quit |
+| **`** or **F1** | developer console | | |
 
 **HUD**:
 - **Minimap**, bottom left: a sea chart centred on your boat (the yellow arrow), with north up.
@@ -61,6 +62,35 @@ cmake --build build -j
 
 A full day lasts 16 real minutes. The lamps come on at dusk.
 
+### Developer console
+Press **`** (the key left of 1) or **F1** to open it. The game ignores the keyboard while you type, and **Esc** or **`** closes the console again. Type `help` for the list, `help <command>` for details, or `help all` for every command on one line each.
+
+| Group | Commands |
+| --- | --- |
+| Boat | `tp <x> <z>`, `tp island [mountain\|atoll\|stacks\|cay]`, `pos`, `heading <deg>`, `speed [m/s]`, `ghost [on\|off]`, `tune [name value\|reset]`, `respawn` |
+| World | `seed [n]`, `newworld`, `viewdist [chunks]`, `waves [0..3]`, `fog [density\|reset]` |
+| Time | `time [hh[:mm]]`, `pause [on\|off]`, `daylength [minutes]` |
+| Camera | `view chase\|side\|high\|low\|cove`, `freecam [on\|off]`, `fov [deg]`, `zoom [m]` |
+| Display | `hud`, `wireframe`, `lights`, `minimap [400\|1000\|2500]`, `reload`, `screenshot [file]`, `stats` |
+| General | `help`, `clear`, `echo`, `exec <file>`, `quit` |
+
+- **Shortcuts**:
+  - Typing a command without its value shows the current setting (`time`, `speed`, `fog`).
+  - On/off commands toggle when given no argument.
+  - `tp ~200 ~` moves 200 m east of where you are.
+- **Several at once**: separate commands with `;`, e.g. `time 19; waves 2; view high`.
+- **Keys**:
+  - **Tab** completes command names and options. A hint box under the input shows matching commands and their usage.
+  - **Up / Down**: history.
+  - **PgUp / PgDn** or the mouse wheel: scroll back.
+  - **Ctrl+Backspace**: delete a word.
+  - **Ctrl+V**: paste.
+  - **Ctrl+L**: clear.
+- **Testing handling**: `tune` lists the boat's handling values next to their defaults. Change them while you sail, e.g. `tune turn 1.4`, then use `tune reset` to undo.
+- **Scripts**:
+  - `exec file.cfg` runs a file of commands. Lines starting with `#` or `//` are comments.
+  - If an `autoexec.cfg` is in the folder you run the game from, it runs at start-up.
+
 ### Command line
 ```
 SeaSail --seed 7                          # a different world
@@ -69,6 +99,9 @@ SeaSail --hour 21.5                       # start at night
 SeaSail --radius 48                       # see further (in 128 m chunks; default 36 = 4.6 km)
 SeaSail --view high --simulate 20 --steer 0.3 --shot test.bmp
                                           # drive for 20 s on autopilot, render one frame, exit
+SeaSail --cmd "tp island atoll; time 19"  # run console commands at start (repeatable)
+SeaSail --exec test.cfg                   # run a file of console commands at start
+SeaSail --console                         # start with the console open (also shows in --shot)
 ```
 
 ---
@@ -122,6 +155,15 @@ Height is a pure function of world `(x, z)` in double precision. Nothing is stor
 - Painting takes about 0.1 s, so it runs on a background thread (`std::async`). The old chart keeps being drawn, offset to the boat's position, until the new one is ready, so it never stalls a frame.
 - It's repainted when the boat nears the edge of the painted area or the zoom changes.
 - A shader cuts it into a circle, and the HUD draws the rim, ticks, icons and boat arrow on top.
+
+### Console (`src/core/Console.cpp`, `src/render/ConsoleView.cpp`, `TextRenderer.cpp`)
+- `Console` is plain C++ with no OpenGL or GLFW in it. It holds:
+  - a table of commands (name, usage, help, a `std::function`, and Tab options)
+  - a tokenizer that handles `;` and `"quoted strings"`
+  - the scroll-back log, history and completion
+- `main.cpp` registers the game's commands and feeds the console GLFW key and character events.
+- Text uses a public-domain 8×8 bitmap font (`Font8x8.h`), unpacked at start-up into a 128×48 texture atlas. Each character is one textured quad, and the whole console is two draw calls: panel shapes, then text. The scale is a whole number, so the pixels stay sharp.
+- Screenshots (`P` or `screenshot`) are saved after the scene and HUD are drawn but before the console, so it never ends up in the picture.
 
 ### Anti-aliasing
 The off-screen scene gets **FXAA** in the composite pass. For each pixel it finds the local edge direction from the brightness of the four diagonal neighbours, then blurs only along that edge.
@@ -177,18 +219,22 @@ GPU floats jitter a few km from (0, 0). Everything is therefore drawn relative t
 3. **Sea**: drawn on top, reading the scene's colour and distance to see through itself.
 4. **Lighthouse beams**: added on top.
 5. **HUD**.
+6. **Console**, if it's open (screenshots are taken just before this).
 
 ---
 
 ## Code layout
 ```
-src/main.cpp              window, input, game loop, render passes, HUD, test mode
-src/core/                 SeaMath.h (Vec3, Mat4, Quat), Camera, Noise, Shader (#include, hot reload), Screenshot
+src/main.cpp              window, input, game loop, render passes, HUD, console commands, test mode
+src/core/                 SeaMath.h (Vec3, Mat4, Quat), Camera, Noise, Shader (#include, hot reload), Screenshot,
+                          Console (commands, history, completion)
 src/world/                IslandGenerator, TerrainStreamer, Ocean, Props (placement), Landmarks
 src/game/                 Boat (handling), BoatModel (procedural mesh), ChaseCamera, Environment (time of day)
 src/render/               Mesh (+builder), PropRenderer (instancing + plant models), LandmarkModels,
-                          SceneTarget (HDR + distance), Frustum, Hud, Minimap
-shaders/                  sky, terrain, props, object, water, beam, composite (FXAA), hud, minimap + shared common.glsl
+                          SceneTarget (HDR + distance), Frustum, Hud, Minimap, TextRenderer (+ Font8x8.h),
+                          ConsoleView
+shaders/                  sky, terrain, props, object, water, beam, composite (FXAA), hud, minimap, text
+                          + shared common.glsl
 external/glad/            OpenGL 3.3 core loader
 ```
 

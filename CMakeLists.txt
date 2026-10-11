@@ -36,6 +36,7 @@ add_executable(SeaSail
     src/core/Noise.cpp
     src/core/Shader.cpp
     src/core/Screenshot.cpp
+    src/core/Console.cpp
     src/world/IslandGenerator.cpp
     src/world/TerrainStreamer.cpp
     src/world/Ocean.cpp
@@ -50,7 +51,9 @@ add_executable(SeaSail
     src/render/Hud.cpp
     src/render/PropRenderer.cpp
     src/render/LandmarkModels.cpp
-    src/render/Minimap.cpp)
+    src/render/Minimap.cpp
+    src/render/TextRenderer.cpp
+    src/render/ConsoleView.cpp)
 target_include_directories(SeaSail PRIVATE src src/core src/world src/game src/render)
 target_link_libraries(SeaSail PRIVATE glad glfw Threads::Threads)
 

@@ -10,17 +10,6 @@ namespace sea {
 
 namespace {
 
-// Handling. Tweak these to change how the boat feels.
-constexpr float kThrust       = 4.2f;    // m/s^2 at full throttle
-constexpr float kBoostMul     = 1.7f;
-constexpr float kReverseMul   = 0.45f;   // reverse is weaker
-constexpr float kLinearDrag   = 0.22f;   // 1/s
-constexpr float kQuadDrag     = 0.035f;  // 1/m   -> top speed ~ 8 m/s (15 knots)
-constexpr float kSideGrip     = 2.8f;    // how fast sideways drift dies out (1/s)
-constexpr float kTurnRate     = 0.95f;   // rad/s at speed
-constexpr float kIdleTurn     = 0.35f;   // fraction of kTurnRate when stopped
-constexpr float kEngineSpool  = 2.5f;    // how fast the throttle responds (1/s)
-
 constexpr float kWakeInterval = 0.2f;    // seconds between wake points
 constexpr double kWakeLife    = 12.0;    // seconds a wake point lasts
 
@@ -34,6 +23,21 @@ void Boat::placeAt(double x, double z, float heading)
     velX_ = velZ_ = speedFwd_ = yawRate_ = engine_ = 0.0f;
     y_ = vy_ = pitch_ = roll_ = 0.0f;
     wake_.clear();
+}
+
+void Boat::setHeading(float radians)
+{
+    heading_ = wrapAngle(radians);
+    yawRate_ = 0.0f;
+    setSpeed(speedFwd_);
+}
+
+void Boat::setSpeed(float v)
+{
+    Vec3 f = forward();
+    velX_ = f.x * v;
+    velZ_ = f.z * v;
+    speedFwd_ = lastSpeed_ = v;
 }
 
 Quat Boat::orientation() const
@@ -54,9 +58,10 @@ Mat4 Boat::transform(double originX, double originZ) const
 void Boat::update(const BoatInput& in, const Ocean& ocean, const IslandGenerator& world, double time, float dt)
 {
     if (dt <= 0.0f) return;
+    const BoatTuning& t = tuning;
 
     // ---- engine and steering -------------------------------------------------
-    engine_ = approach(engine_, clampf(in.throttle, -1.0f, 1.0f), kEngineSpool, dt);
+    engine_ = approach(engine_, clampf(in.throttle, -1.0f, 1.0f), t.engineSpool, dt);
 
     Vec3 fwd = forward();
     Vec3 side{-fwd.z, 0.0f, fwd.x};  // starboard
@@ -65,15 +70,15 @@ void Boat::update(const BoatInput& in, const Ocean& ocean, const IslandGenerator
     float vf = velX_ * fwd.x + velZ_ * fwd.z;
     float vs = velX_ * side.x + velZ_ * side.z;
 
-    float thrust = engine_ * kThrust * (engine_ < 0.0f ? kReverseMul : 1.0f) * (in.boost && engine_ > 0.0f ? kBoostMul : 1.0f);
-    float accel  = thrust - kLinearDrag * vf - kQuadDrag * vf * std::fabs(vf);
+    float thrust = engine_ * t.thrust * (engine_ < 0.0f ? t.reverseMul : 1.0f) * (in.boost && engine_ > 0.0f ? t.boostMul : 1.0f);
+    float accel  = thrust - t.linearDrag * vf - t.quadDrag * vf * std::fabs(vf);
     vf += accel * dt;
-    vs *= std::exp(-kSideGrip * dt);  // the keel resists sliding sideways
+    vs *= std::exp(-t.sideGrip * dt);  // the keel resists sliding sideways
 
     // Turning: much stronger with water flowing past the rudder, but a
     // little even at rest so you can always turn around.
     float flow = clampf(std::fabs(vf) / 6.0f, 0.0f, 1.0f);
-    float targetYawRate = clampf(in.steer, -1.0f, 1.0f) * kTurnRate * (kIdleTurn + (1.0f - kIdleTurn) * flow);
+    float targetYawRate = clampf(in.steer, -1.0f, 1.0f) * t.turnRate * (t.idleTurn + (1.0f - t.idleTurn) * flow);
     yawRate_ = approach(yawRate_, targetYawRate, 4.0f, dt);
     heading_ = wrapAngle(heading_ + yawRate_ * dt);
 
@@ -88,7 +93,8 @@ void Boat::update(const BoatInput& in, const Ocean& ocean, const IslandGenerator
     x_ += static_cast<double>(velX_) * dt;
     z_ += static_cast<double>(velZ_) * dt;
 
-    collideWithShore(world, dt);
+    if (ghost) hitShore_ = false;
+    else       collideWithShore(world, dt);
 
     // ---- riding the waves ---------------------------------------------------
     // Sample the real surface under the bow, stern and both sides; the hull

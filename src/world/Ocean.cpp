@@ -2,6 +2,7 @@
 
 #include "Shader.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 
@@ -39,6 +40,7 @@ Ocean::Ocean()
         float a = wind + d.angle;
         waves_.push_back({std::cos(a), std::sin(a), d.wavelength, d.amplitude, d.steepness, d.displaces});
     }
+    baseWaves_ = waves_;
 
     // Disc of rings around the camera: 25 cm apart at the centre, growing
     // 3.5% per ring out to 20 km. It moves with the camera every frame.
@@ -159,6 +161,23 @@ SurfacePoint Ocean::sample(double x, double z, double time) const
         ny -= q * kA * std::sin(theta);
     }
     return {static_cast<float>(dy), normalize(Vec3{static_cast<float>(nx), static_cast<float>(ny), static_cast<float>(nz)})};
+}
+
+void Ocean::setWaveScale(float scale)
+{
+    // Never exactly zero: the Gerstner maths divides by amplitude.
+    waveScale_ = clampf(scale, 0.0f, 3.0f);
+    const float sc = std::max(waveScale_, 0.001f);
+    // Steepness is Q*k*A, so it grows with height. Once the waves' total
+    // passes ~0.9 the crests fold over themselves (and the CPU surface solve
+    // stops converging), so past that point waves get taller, not sharper.
+    float total = 0.0f;
+    for (const Wave& w : baseWaves_) total += w.steepness;
+    const float steepSc = total > 0.0f ? std::min(sc, 0.9f / total) : sc;
+    for (size_t i = 0; i < waves_.size(); ++i) {
+        waves_[i].amplitude = baseWaves_[i].amplitude * sc;
+        waves_[i].steepness = baseWaves_[i].steepness * steepSc;
+    }
 }
 
 } // namespace sea

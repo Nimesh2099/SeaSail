@@ -11,16 +11,20 @@
 //   M            minimap zoom                  H         hide HUD
 //   F            wireframe                     R         reload shaders
 //   P            screenshot (.bmp)             Esc       quit
+//   ` or F1      developer console (type `help` in it)
 //
 // Command line (handy for testing and README images)
 //   SeaSail [--seed N] [--radius CHUNKS] [--width W --height H] [--hour 0..24]
 //           [--view chase|side|high|low|cove] [--simulate SECONDS] [--steer -1..1]
 //           [--island mountain|atoll|stacks|cay] [--time SECONDS] [--shot out.bmp]
+//           [--cmd "console commands"] [--exec file.cfg] [--console]
 
 #include "Boat.h"
 #include "BoatModel.h"
 #include "Camera.h"
 #include "ChaseCamera.h"
+#include "Console.h"
+#include "ConsoleView.h"
 #include "Environment.h"
 #include "Frustum.h"
 #include "Hud.h"
@@ -35,6 +39,7 @@
 #include "Screenshot.h"
 #include "Shader.h"
 #include "TerrainStreamer.h"
+#include "TextRenderer.h"
 
 #include <glad/gl.h>
 #include <GLFW/glfw3.h>
@@ -46,6 +51,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -69,6 +75,8 @@ struct Options {
     double      time     = 30.0;   // start time (waves, caustics)
     float       hour     = 10.0f;  // start time of day
     IslandType  island   = IslandType::Mountain;  // kind of island to start next to
+    std::vector<std::string> startup;  // console lines to run at start ("exec file" for --exec)
+    bool        console  = false;      // start with the console open
 };
 
 Options parseArgs(int argc, char** argv)
@@ -86,6 +94,9 @@ Options parseArgs(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--steer"))    o.steer    = static_cast<float>(std::atof(next()));
         else if (!std::strcmp(argv[i], "--time"))     o.time     = std::atof(next());
         else if (!std::strcmp(argv[i], "--hour"))     o.hour     = static_cast<float>(std::atof(next()));
+        else if (!std::strcmp(argv[i], "--cmd"))      o.startup.push_back(next());
+        else if (!std::strcmp(argv[i], "--exec"))     o.startup.push_back(std::string("exec \"") + next() + "\"");
+        else if (!std::strcmp(argv[i], "--console"))  o.console  = true;
         else if (!std::strcmp(argv[i], "--island")) {
             std::string t = next();
             o.island = t == "atoll" ? IslandType::Atoll : t == "stacks" ? IslandType::SeaStacks
@@ -113,6 +124,8 @@ struct Lights {
     }
 };
 
+constexpr float kDefaultFog = 0.00024f;
+
 struct App {
     Options     opt;
     GLFWwindow* window = nullptr;
@@ -126,8 +139,9 @@ struct App {
     std::unique_ptr<PropRenderer>    props;
     std::unique_ptr<Hud>             hud;
     std::unique_ptr<Minimap>         minimap;
+    std::unique_ptr<TextRenderer>    text;
     std::unique_ptr<Shader> skyShader, terrainShader, objectShader, propShader, waterShader, compositeShader,
-                            beamShader, hudShader, minimapShader;
+                            beamShader, hudShader, minimapShader, textShader;
     GLuint emptyVao = 0;
 
     Landmarks   landmarks;
@@ -139,6 +153,8 @@ struct App {
     Lights      lights;
     bool        freeCam = false;
     bool        boatLights = true;
+    float       fogDensity = kDefaultFog;
+    Console     console;
 
     // Floating origin: everything the GPU sees is relative to this point,
     // which hops in 1 km steps to stay near the player.
@@ -148,13 +164,16 @@ struct App {
     bool   mouseCaptured = false, firstMouse = true;
     double lastMouseX = 0.0, lastMouseY = 0.0;
     float  scrollAccum = 0.0f;
+    bool   mouseBeforeConsole = false;  // capture state to restore when the console closes
     bool   showHud = true, wireframe = false;
     int    screenshotCount = 0;
+    std::string pendingShot;            // save this file after the next frame is drawn
+    float  fps = 0.0f;
 
     std::vector<Shader*> allShaders() const
     {
         return {skyShader.get(), terrainShader.get(), objectShader.get(), propShader.get(), waterShader.get(),
-                compositeShader.get(), beamShader.get(), hudShader.get(), minimapShader.get()};
+                compositeShader.get(), beamShader.get(), hudShader.get(), minimapShader.get(), textShader.get()};
     }
 };
 
@@ -255,10 +274,82 @@ void setMouseCapture(App& a, bool on)
 
 void onScroll(GLFWwindow*, double, double dy) { g_app->scrollAccum += static_cast<float>(dy); }
 
-void onKey(GLFWwindow* w, int key, int, int action, int)
+// Open or close the console. The mouse is freed while it's open and put
+// back the way it was afterwards.
+void setConsoleOpen(App& a, bool open)
 {
-    if (action != GLFW_PRESS) return;
+    if (open == a.console.isOpen()) return;
+    a.console.setOpen(open);
+    if (open) {
+        a.mouseBeforeConsole = a.mouseCaptured;
+        setMouseCapture(a, false);
+    } else if (a.mouseBeforeConsole) {
+        setMouseCapture(a, true);
+    }
+}
+
+void newWorld(App& a)
+{
+    uint32_t seed = static_cast<uint32_t>(std::rand()) * 2654435761u + static_cast<uint32_t>(std::time(nullptr));
+    rebuildWorld(a, seed);
+    spawnBoat(a, a.boat.x(), a.boat.z());
+    a.console.print("New world: seed %u", seed);
+}
+
+// The next free "seasail_NN.bmp".
+std::string nextShotName(App& a)
+{
+    char name[64];
+    std::snprintf(name, sizeof(name), "seasail_%02d.bmp", a.screenshotCount++);
+    return name;
+}
+
+void onChar(GLFWwindow*, unsigned int codepoint) { g_app->console.onChar(codepoint); }
+
+// Keys while the console is open: editing only, no game controls.
+void consoleKey(App& a, int key, int mods)
+{
+    const bool ctrl = (mods & GLFW_MOD_CONTROL) != 0;
+    Console& c = a.console;
+    switch (key) {
+    case GLFW_KEY_ESCAPE:    setConsoleOpen(a, false); break;
+    case GLFW_KEY_ENTER:
+    case GLFW_KEY_KP_ENTER:  c.onKey(ConsoleKey::Enter, ctrl); break;
+    case GLFW_KEY_BACKSPACE: c.onKey(ConsoleKey::Backspace, ctrl); break;
+    case GLFW_KEY_DELETE:    c.onKey(ConsoleKey::Delete, ctrl); break;
+    case GLFW_KEY_LEFT:      c.onKey(ConsoleKey::Left, ctrl); break;
+    case GLFW_KEY_RIGHT:     c.onKey(ConsoleKey::Right, ctrl); break;
+    case GLFW_KEY_HOME:      c.onKey(ConsoleKey::Home, ctrl); break;
+    case GLFW_KEY_END:       c.onKey(ConsoleKey::End, ctrl); break;
+    case GLFW_KEY_UP:        c.onKey(ConsoleKey::Up, ctrl); break;
+    case GLFW_KEY_DOWN:      c.onKey(ConsoleKey::Down, ctrl); break;
+    case GLFW_KEY_TAB:       c.onKey(ConsoleKey::Tab, ctrl); break;
+    case GLFW_KEY_PAGE_UP:   c.onKey(ConsoleKey::PageUp, ctrl); break;
+    case GLFW_KEY_PAGE_DOWN: c.onKey(ConsoleKey::PageDown, ctrl); break;
+    case GLFW_KEY_L:         if (ctrl) c.clear(); break;
+    case GLFW_KEY_V:
+        if (ctrl) {
+            const char* clip = glfwGetClipboardString(a.window);
+            if (clip) c.insertText(clip);
+        }
+        break;
+    default: break;
+    }
+}
+
+void onKey(GLFWwindow* w, int key, int, int action, int mods)
+{
     App& a = *g_app;
+    // ` (the key left of 1) or F1 opens and closes the console.
+    if (action == GLFW_PRESS && (key == GLFW_KEY_GRAVE_ACCENT || key == GLFW_KEY_F1)) {
+        setConsoleOpen(a, !a.console.isOpen());
+        return;
+    }
+    if (a.console.isOpen()) {
+        if (action != GLFW_RELEASE) consoleKey(a, key, mods);  // presses and key repeat
+        return;
+    }
+    if (action != GLFW_PRESS) return;
     switch (key) {
     case GLFW_KEY_ESCAPE:    glfwSetWindowShouldClose(w, GLFW_TRUE); break;
     case GLFW_KEY_TAB:       setMouseCapture(a, !a.mouseCaptured); break;
@@ -272,25 +363,12 @@ void onKey(GLFWwindow* w, int key, int, int action, int)
         if (!a.freeCam) a.chase.reset();
         break;
     case GLFW_KEY_BACKSPACE: spawnBoat(a, a.boat.x(), a.boat.z()); break;
-    case GLFW_KEY_N: {
-        uint32_t seed = static_cast<uint32_t>(std::rand()) * 2654435761u + static_cast<uint32_t>(std::time(nullptr));
-        rebuildWorld(a, seed);
-        spawnBoat(a, a.boat.x(), a.boat.z());
-        std::printf("New world: seed %u\n", seed);
-        break;
-    }
+    case GLFW_KEY_N:         newWorld(a); break;
     case GLFW_KEY_R:
         for (Shader* s : a.allShaders()) s->reload();
         std::printf("Shaders reloaded\n");
         break;
-    case GLFW_KEY_P: {
-        int fw, fh;
-        glfwGetFramebufferSize(w, &fw, &fh);
-        char name[64];
-        std::snprintf(name, sizeof(name), "seasail_%02d.bmp", a.screenshotCount++);
-        if (saveBmp(name, fw, fh)) std::printf("Saved %s\n", name);
-        break;
-    }
+    case GLFW_KEY_P:         a.pendingShot = nextShotName(a); break;  // saved after the frame is drawn
     default: break;
     }
 }
@@ -321,7 +399,10 @@ void stepSimulation(App& a, const BoatInput& in, float mouseDx, float mouseDy, f
 void update(App& a, float dt)
 {
     GLFWwindow* w = a.window;
-    auto key = [&](int k) { return glfwGetKey(w, k) == GLFW_PRESS ? 1.0f : 0.0f; };
+    // While the console is open the keyboard is for typing, not sailing.
+    const bool typing = a.console.isOpen();
+    auto key = [&](int k) { return !typing && glfwGetKey(w, k) == GLFW_PRESS ? 1.0f : 0.0f; };
+    a.console.update(dt);
 
     float mdx = 0.0f, mdy = 0.0f;
     if (a.mouseCaptured) {
@@ -337,6 +418,10 @@ void update(App& a, float dt)
     }
     float scroll = a.scrollAccum;
     a.scrollAccum = 0.0f;
+    if (typing) {  // the wheel scrolls the console log instead
+        a.console.scrollBy(static_cast<int>(std::lround(scroll * 3.0f)));
+        scroll = 0.0f;
+    }
 
     BoatInput in;
     if (!a.freeCam) {
@@ -416,7 +501,7 @@ void setCommonUniforms(const Shader& s, const App& a)
     s.set("uMoonDir", e.moonDir());
     s.set("uMoonLight", e.moonLight());
     s.set("uNight", e.night());
-    s.set("uFogDensity", 0.00024f);
+    s.set("uFogDensity", a.fogDensity);
     s.set("uViewDistance", a.terrain->viewDistance());
     s.set("uExposure", e.exposure());
     s.setVec2("uOriginMod", static_cast<float>(std::fmod(a.originX, 4096.0)), static_cast<float>(std::fmod(a.originZ, 4096.0)));
@@ -505,7 +590,7 @@ void drawHud(App& a, int w, int h)
     const float gx = cx + r + 18.0f * s, gy = cy - r, gw = 9.0f * s, gh = 2.0f * r;
     hud.rect(gx - 2 * s, gy - 2 * s, gw + 4 * s, gh + 4 * s, shade);
     float sp = clampf(std::fabs(a.boat.speed()) / 12.0f, 0.0f, 1.0f);
-    bool boosting = glfwGetKey(a.window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS && a.boat.engine() > 0.1f;
+    bool boosting = !a.console.isOpen() && glfwGetKey(a.window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS && a.boat.engine() > 0.1f;
     hud.rect(gx, gy, gw, gh * sp, boosting ? Rgba{1.0f, 0.7f, 0.25f, 0.9f} : Rgba{0.55f, 0.9f, 1.0f, 0.85f});
 
     // Engine telegraph: centre line = stop, up = ahead, down = astern.
@@ -686,6 +771,7 @@ void shutdown(App& a)
     a.beamMesh.reset();
     a.props.reset();
     a.hud.reset();
+    a.text.reset();
     a.skyShader.reset();
     a.terrainShader.reset();
     a.objectShader.reset();
@@ -695,6 +781,7 @@ void shutdown(App& a)
     a.beamShader.reset();
     a.hudShader.reset();
     a.minimapShader.reset();
+    a.textShader.reset();
     if (a.emptyVao) glDeleteVertexArrays(1, &a.emptyVao);
     glfwTerminate();
 }
@@ -710,7 +797,8 @@ void printControls()
         "  M          minimap zoom\n"
         "  Backspace  respawn by an island        N          new world\n"
         "  Tab        release/capture mouse       H          hide HUD       F  wireframe\n"
-        "  R          reload shaders              P          screenshot     Esc  quit\n\n");
+        "  R          reload shaders              P          screenshot     Esc  quit\n"
+        "  ` or F1    developer console (type help)\n\n");
 }
 
 float bearingDegrees(const Vec3& f)
@@ -726,6 +814,459 @@ std::unique_ptr<Mesh> buildMesh(void (*fn)(MeshBuilder&))
     auto m = std::make_unique<Mesh>();
     m->upload(mb);
     return m;
+}
+
+// ----------------------------------------------------------------- console --
+//
+// Commands for testing by hand. Each one prints what it did, and most show
+// the current value when given no arguments.
+
+const char* islandName(IslandType t)
+{
+    switch (t) {
+    case IslandType::Mountain:  return "mountain";
+    case IslandType::Atoll:     return "atoll";
+    case IslandType::SeaStacks: return "stacks";
+    case IslandType::Cay:       return "cay";
+    case IslandType::None:      break;
+    }
+    return "none";
+}
+
+// For sentences: "an atoll", "a cay".
+const char* islandPhrase(IslandType t)
+{
+    switch (t) {
+    case IslandType::Mountain:  return "a mountain island";
+    case IslandType::Atoll:     return "an atoll";
+    case IslandType::SeaStacks: return "the sea stacks";
+    case IslandType::Cay:       return "a cay";
+    case IslandType::None:      break;
+    }
+    return "open sea";
+}
+
+bool parseIslandType(const std::string& s, IslandType& out)
+{
+    std::string t = Console::lower(s);
+    if (t == "mountain") out = IslandType::Mountain;
+    else if (t == "atoll") out = IslandType::Atoll;
+    else if (t == "stacks" || t == "seastacks") out = IslandType::SeaStacks;
+    else if (t == "cay") out = IslandType::Cay;
+    else if (t == "any") out = IslandType::None;
+    else return false;
+    return true;
+}
+
+// Islands within `rings` cells of (x, z), nearest first.
+std::vector<IslandInfo> islandsNear(const IslandGenerator& w, double x, double z, IslandType kind, int rings)
+{
+    const double cell = IslandGenerator::kCellSize;
+    const int64_t cx = static_cast<int64_t>(std::floor(x / cell)), cz = static_cast<int64_t>(std::floor(z / cell));
+    std::vector<IslandInfo> out;
+    for (int64_t j = cz - rings; j <= cz + rings; ++j)
+        for (int64_t i = cx - rings; i <= cx + rings; ++i) {
+            IslandInfo is = w.islandInCell(i, j);
+            if (is.type != IslandType::None && (kind == IslandType::None || is.type == kind)) out.push_back(is);
+        }
+    auto d2 = [&](const IslandInfo& is) { return (is.cx - x) * (is.cx - x) + (is.cz - z) * (is.cz - z); };
+    std::sort(out.begin(), out.end(), [&](const IslandInfo& p, const IslandInfo& q) { return d2(p) < d2(q); });
+    return out;
+}
+
+const char* compassPoint(float deg)
+{
+    static const char* const names[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+    int i = static_cast<int>(std::floor((deg + 22.5f) / 45.0f));
+    return names[((i % 8) + 8) % 8];
+}
+
+// Move the boat (and the floating origin) to an exact spot, stopped.
+void teleport(App& a, double x, double z, float heading)
+{
+    a.boat.placeAt(x, z, heading);
+    a.originX = std::floor(x / kRebaseStep) * kRebaseStep;
+    a.originZ = std::floor(z / kRebaseStep) * kRebaseStep;
+    a.freeCam = false;
+    a.chase.reset();
+}
+
+// "250" -> 250; "~" -> current; "~-40" -> current - 40 (relative, like Minecraft).
+bool coordinate(Console& c, const std::string& s, double current, double& out)
+{
+    if (!s.empty() && s[0] == '~') {
+        double d = 0.0;
+        if (s.size() > 1 && !c.number(s.substr(1), d, "tp")) return false;
+        out = current + d;
+        return true;
+    }
+    return c.number(s, out, "tp");
+}
+
+std::string clockString(float hours)
+{
+    int hh = static_cast<int>(hours), mm = static_cast<int>((hours - static_cast<float>(hh)) * 60.0f);
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%02d:%02d", hh % 24, mm);
+    return buf;
+}
+
+struct TuneVar {
+    const char* name;
+    float BoatTuning::*value;
+    const char* help;
+};
+
+const TuneVar kTuneVars[] = {
+    {"thrust",     &BoatTuning::thrust,      "acceleration at full throttle (m/s^2)"},
+    {"boost",      &BoatTuning::boostMul,    "thrust multiplier while boosting"},
+    {"reverse",    &BoatTuning::reverseMul,  "thrust multiplier going astern"},
+    {"drag",       &BoatTuning::linearDrag,  "linear drag (1/s)"},
+    {"quaddrag",   &BoatTuning::quadDrag,    "quadratic drag (1/m): sets top speed"},
+    {"grip",       &BoatTuning::sideGrip,    "how fast sideways drift dies (1/s)"},
+    {"turn",       &BoatTuning::turnRate,    "turn rate at speed (rad/s)"},
+    {"idleturn",   &BoatTuning::idleTurn,    "fraction of turn rate when stopped"},
+    {"spool",      &BoatTuning::engineSpool, "how fast the engine answers the throttle (1/s)"},
+};
+
+void registerCommands(App& a)
+{
+    auto add = [&a](const char* cat, const char* name, const char* usage, const char* help,
+                    std::function<void(const ConsoleArgs&)> fn, std::vector<std::string> options = {}) {
+        a.console.add({name, cat, usage, help, std::move(fn), std::move(options)});
+    };
+    auto onOffText = [](bool on) { return on ? "on" : "off"; };
+
+    // ---- General -----------------------------------------------------------
+    add("General", "help", "[command|all]", "list commands, or explain one", [&a](const ConsoleArgs& args) {
+        Console& c = a.console;
+        static const char* const order[] = {"General", "Boat", "World", "Time", "Camera", "Display"};
+        if (args.empty()) {
+            c.heading("Commands  (help <command> for details, help all for one line each)");
+            for (const char* cat : order) {
+                std::string names;
+                for (const ConsoleCommand& cmd : c.commands())
+                    if (cmd.category == cat) names += "  " + cmd.name;
+                c.print("  %-8s%s", cat, names.c_str());
+            }
+            c.print("Several at once: time 6; view high.  Coordinates can be relative: tp ~200 ~");
+            return;
+        }
+        if (Console::lower(args[0]) == "all") {
+            for (const char* cat : order) {
+                c.heading("%s", cat);
+                for (const ConsoleCommand& cmd : c.commands()) {
+                    if (cmd.category != cat) continue;
+                    std::string head = cmd.name + " " + cmd.usage;
+                    c.print("  %-28s %s", head.c_str(), cmd.help.c_str());
+                }
+            }
+            return;
+        }
+        const ConsoleCommand* cmd = c.find(args[0]);
+        if (!cmd) {
+            c.error("No command '%s'", args[0].c_str());
+            return;
+        }
+        c.heading("%s %s", cmd->name.c_str(), cmd->usage.c_str());
+        c.print("  %s", cmd->help.c_str());
+        if (!cmd->options.empty()) {
+            std::string opts;
+            for (const std::string& o : cmd->options) opts += " " + o;
+            c.print("  options:%s", opts.c_str());
+        }
+    });
+    add("General", "clear", "", "clear the console (also Ctrl+L)", [&a](const ConsoleArgs&) { a.console.clear(); });
+    add("General", "echo", "<text>", "print text (handy in exec files)", [&a](const ConsoleArgs& args) {
+        std::string s;
+        for (const std::string& w : args) s += (s.empty() ? "" : " ") + w;
+        a.console.print("%s", s.c_str());
+    });
+    add("General", "exec", "<file>", "run the commands in a text file, one per line", [&a](const ConsoleArgs& args) {
+        if (args.empty()) { a.console.error("usage: exec <file>"); return; }
+        if (!a.console.execFile(args[0])) a.console.error("exec: can't open '%s'", args[0].c_str());
+    });
+    add("General", "quit", "", "close the game", [&a](const ConsoleArgs&) { glfwSetWindowShouldClose(a.window, GLFW_TRUE); });
+
+    // ---- Boat --------------------------------------------------------------
+    add("Boat", "tp", "<x> <z> | island [type]", "teleport to world metres (~ = relative), or to the next island",
+        [&a](const ConsoleArgs& args) {
+            Console& c = a.console;
+            if (!args.empty() && Console::lower(args[0]) == "island") {
+                IslandType kind = IslandType::None;
+                if (args.size() > 1 && !parseIslandType(args[1], kind)) {
+                    c.error("tp island: unknown type '%s' (mountain, atoll, stacks, cay, any)", args[1].c_str());
+                    return;
+                }
+                // Nearest island of that kind that we're not already at.
+                for (const IslandInfo& is : islandsNear(*a.world, a.boat.x(), a.boat.z(), kind, 6)) {
+                    double dist = std::hypot(is.cx - a.boat.x(), is.cz - a.boat.z());
+                    if (dist < is.radius * 2.0 + 300.0) continue;
+                    spawnBoat(a, is.cx, is.cz, is.type);
+                    a.freeCam = false;
+                    c.print("Sailed to %s %.1f km away, at (%.0f, %.0f)", islandPhrase(is.type), dist / 1000.0, is.cx,
+                            is.cz);
+                    return;
+                }
+                c.error("tp island: no %s island within 9 km", kind == IslandType::None ? "other" : islandName(kind));
+                return;
+            }
+            if (args.size() != 2) {
+                c.error("usage: tp <x> <z>   or   tp island [mountain|atoll|stacks|cay]");
+                return;
+            }
+            double x, z;
+            if (!coordinate(c, args[0], a.boat.x(), x) || !coordinate(c, args[1], a.boat.z(), z)) return;
+            teleport(a, x, z, a.boat.heading());
+            float ground = a.world->height(x, z);
+            c.print("Teleported to (%.0f, %.0f)", x, z);
+            if (ground > -1.5f && !a.boat.ghost)
+                c.error("That's on land (%.0f m). 'ghost on' to sail off, or 'respawn'.", ground);
+        },
+        {"island"});
+    add("Boat", "pos", "", "where am I: position, heading, speed, depth, nearest island", [&a](const ConsoleArgs&) {
+        Console& c = a.console;
+        double x = a.boat.x(), z = a.boat.z();
+        c.print("Position  x %.1f  z %.1f m   (floating origin %.0f, %.0f)", x, z, a.originX, a.originZ);
+        float hdg = bearingDegrees(a.boat.forward());
+        c.print("Heading   %03.0f (%s)   speed %.2f m/s (%.1f kn)   depth %.1f m", hdg, compassPoint(hdg),
+                a.boat.speed(), a.boat.speed() * 1.944f, -a.world->height(x, z));
+        auto near = islandsNear(*a.world, x, z, IslandType::None, 2);
+        if (!near.empty()) {
+            const IslandInfo& is = near[0];
+            float b = bearingDegrees(Vec3{static_cast<float>(is.cx - x), 0.0f, static_cast<float>(is.cz - z)});
+            c.print("Nearest island: %s, %.2f km %s", islandName(is.type), std::hypot(is.cx - x, is.cz - z) / 1000.0,
+                    compassPoint(b));
+        }
+    });
+    add("Boat", "heading", "<degrees>", "point the boat at a compass bearing (0 = north, 90 = east)",
+        [&a](const ConsoleArgs& args) {
+            Console& c = a.console;
+            if (args.empty()) {
+                c.print("heading %03.0f", bearingDegrees(a.boat.forward()));
+                return;
+            }
+            float deg;
+            if (!c.number(args[0], deg, "heading")) return;
+            float b = radians(deg);
+            a.boat.setHeading(std::atan2(-std::cos(b), std::sin(b)));  // bearing -> (cos h, sin h) = (sin b, -cos b)
+            c.print("heading %03.0f", bearingDegrees(a.boat.forward()));
+        });
+    add("Boat", "speed", "[m/s]", "show or set the boat's speed (drag then takes over)", [&a](const ConsoleArgs& args) {
+        Console& c = a.console;
+        if (!args.empty()) {
+            float v;
+            if (!c.number(args[0], v, "speed")) return;
+            a.boat.setSpeed(clampf(v, -20.0f, 100.0f));
+        }
+        c.print("speed %.2f m/s (%.1f kn)", a.boat.speed(), a.boat.speed() * 1.944f);
+    });
+    add("Boat", "ghost", "[on|off]", "sail straight through land", [&a, onOffText](const ConsoleArgs& args) {
+        bool on;
+        if (!a.console.onOff(args, a.boat.ghost, on)) return;
+        a.boat.ghost = on;
+        a.console.print("ghost %s", onOffText(on));
+    }, {"on", "off"});
+    {
+        std::vector<std::string> names{"reset"};
+        for (const TuneVar& t : kTuneVars) names.push_back(t.name);
+        add("Boat", "tune", "[name value | reset]", "show or change boat handling live", [&a](const ConsoleArgs& args) {
+            Console& c = a.console;
+            const BoatTuning defaults;
+            if (args.size() == 1 && Console::lower(args[0]) == "reset") {
+                a.boat.tuning = defaults;
+                c.print("Boat handling reset to defaults");
+                return;
+            }
+            if (args.size() == 2) {
+                for (const TuneVar& t : kTuneVars) {
+                    if (Console::lower(args[0]) != t.name) continue;
+                    float v;
+                    if (!c.number(args[1], v, "tune")) return;
+                    a.boat.tuning.*t.value = std::max(0.0f, v);
+                    c.print("%s = %g  (default %g)", t.name, a.boat.tuning.*t.value, defaults.*t.value);
+                    return;
+                }
+                c.error("tune: no setting '%s'", args[0].c_str());
+                return;
+            }
+            if (!args.empty()) {
+                c.error("usage: tune   |   tune <name> <value>   |   tune reset");
+                return;
+            }
+            c.heading("Boat handling (tune <name> <value>)");
+            for (const TuneVar& t : kTuneVars)
+                c.print("  %-9s %7.3f   default %7.3f   %s", t.name, a.boat.tuning.*t.value, defaults.*t.value, t.help);
+        }, names);
+    }
+    add("Boat", "respawn", "", "move the boat to open water by the nearest island (Backspace)",
+        [&a](const ConsoleArgs&) {
+            spawnBoat(a, a.boat.x(), a.boat.z());
+            a.freeCam = false;
+            a.console.print("Respawned at (%.0f, %.0f)", a.boat.x(), a.boat.z());
+        });
+
+    // ---- World -------------------------------------------------------------
+    add("World", "seed", "[number]", "show the world seed, or rebuild the world from one", [&a](const ConsoleArgs& args) {
+        Console& c = a.console;
+        if (!args.empty()) {
+            double v;
+            if (!c.number(args[0], v, "seed")) return;
+            if (v < 0.0 || v > 4294967295.0) {
+                c.error("seed: must be 0 .. 4294967295");
+                return;
+            }
+            rebuildWorld(a, static_cast<uint32_t>(v));
+            spawnBoat(a, a.boat.x(), a.boat.z());
+        }
+        c.print("seed %u", a.world->seed());
+    });
+    add("World", "newworld", "", "a new world from a random seed (N)", [&a](const ConsoleArgs&) { newWorld(a); });
+    add("World", "viewdist", "[chunks]", "terrain view radius in 128 m chunks (8..64)", [&a](const ConsoleArgs& args) {
+        Console& c = a.console;
+        if (!args.empty()) {
+            float v;
+            if (!c.number(args[0], v, "viewdist")) return;
+            a.opt.radius = std::clamp(static_cast<int>(v), 8, 64);
+            a.terrain.reset();  // stop its workers before making the new one
+            a.terrain = std::make_unique<TerrainStreamer>(*a.world, a.opt.radius);
+        }
+        c.print("viewdist %d chunks (%.1f km)", a.opt.radius, a.terrain->viewDistance() / 1000.0f);
+    });
+    add("World", "waves", "[scale]", "wave height: 0 calm, 1 normal, up to 3 stormy", [&a](const ConsoleArgs& args) {
+        Console& c = a.console;
+        if (!args.empty()) {
+            float v;
+            if (!c.number(args[0], v, "waves")) return;
+            a.ocean->setWaveScale(v);
+        }
+        c.print("waves %.2f", a.ocean->waveScale());
+    });
+    add("World", "fog", "[density|reset]", "fog thickness (default 0.00024, 0 = none)", [&a](const ConsoleArgs& args) {
+        Console& c = a.console;
+        if (!args.empty()) {
+            float v = kDefaultFog;
+            if (Console::lower(args[0]) != "reset" && !c.number(args[0], v, "fog")) return;
+            a.fogDensity = clampf(v, 0.0f, 0.02f);
+        }
+        c.print("fog %g", a.fogDensity);
+    }, {"reset"});
+
+    // ---- Time --------------------------------------------------------------
+    add("Time", "time", "[hh[:mm]]", "show or set the time of day (e.g. time 18:30)", [&a](const ConsoleArgs& args) {
+        Console& c = a.console;
+        if (!args.empty()) {
+            const std::string& t = args[0];
+            size_t colon = t.find(':');
+            float h = 0.0f, m = 0.0f;
+            if (!c.number(t.substr(0, colon), h, "time")) return;
+            if (colon != std::string::npos && !c.number(t.substr(colon + 1), m, "time")) return;
+            a.env.hours = std::fmod(std::fmod(h + m / 60.0f, 24.0f) + 24.0f, 24.0f);
+        }
+        c.print("time %s%s", clockString(a.env.hours).c_str(), a.env.paused ? " (clock paused)" : "");
+    });
+    add("Time", "pause", "[on|off]", "stop or start the clock (T)", [&a](const ConsoleArgs& args) {
+        bool on;
+        if (!a.console.onOff(args, a.env.paused, on)) return;
+        a.env.paused = on;
+        a.console.print("clock %s", on ? "paused" : "running");
+    }, {"on", "off"});
+    add("Time", "daylength", "[minutes]", "real minutes for a full day (default 16)", [&a](const ConsoleArgs& args) {
+        Console& c = a.console;
+        if (!args.empty()) {
+            float v;
+            if (!c.number(args[0], v, "daylength")) return;
+            a.env.dayLengthMinutes = clampf(v, 0.5f, 1440.0f);
+        }
+        c.print("daylength %g minutes", a.env.dayLengthMinutes);
+    });
+
+    // ---- Camera ------------------------------------------------------------
+    add("Camera", "view", "<preset>", "camera preset around the boat", [&a](const ConsoleArgs& args) {
+        if (args.empty()) { a.console.error("usage: view chase|side|high|low|cove"); return; }
+        a.freeCam = false;
+        applyView(a, Console::lower(args[0]));
+        a.console.print("view %s", args[0].c_str());
+    }, {"chase", "side", "high", "low", "cove"});
+    add("Camera", "freecam", "[on|off]", "fly the camera freely (V)", [&a, onOffText](const ConsoleArgs& args) {
+        bool on;
+        if (!a.console.onOff(args, a.freeCam, on)) return;
+        a.freeCam = on;
+        if (!on) a.chase.reset();
+        a.console.print("freecam %s", onOffText(on));
+    }, {"on", "off"});
+    add("Camera", "fov", "[degrees]", "vertical field of view (default 60)", [&a](const ConsoleArgs& args) {
+        Console& c = a.console;
+        if (!args.empty()) {
+            float v;
+            if (!c.number(args[0], v, "fov")) return;
+            a.cam.fovY = radians(clampf(v, 15.0f, 120.0f));
+        }
+        c.print("fov %.0f", a.cam.fovY * 180.0f / kPi);
+    });
+    add("Camera", "zoom", "[metres]", "camera distance from the boat (7..60, mouse wheel)", [&a](const ConsoleArgs& args) {
+        Console& c = a.console;
+        if (!args.empty()) {
+            float v;
+            if (!c.number(args[0], v, "zoom")) return;
+            a.chase.distance = clampf(v, 7.0f, 60.0f);
+        }
+        c.print("zoom %.1f m", a.chase.distance);
+    });
+
+    // ---- Display -----------------------------------------------------------
+    add("Display", "hud", "[on|off]", "show or hide the HUD (H)", [&a, onOffText](const ConsoleArgs& args) {
+        bool on;
+        if (!a.console.onOff(args, a.showHud, on)) return;
+        a.showHud = on;
+        a.console.print("hud %s", onOffText(on));
+    }, {"on", "off"});
+    add("Display", "wireframe", "[on|off]", "draw terrain and sea as wireframe (F)", [&a, onOffText](const ConsoleArgs& args) {
+        bool on;
+        if (!a.console.onOff(args, a.wireframe, on)) return;
+        a.wireframe = on;
+        a.console.print("wireframe %s", onOffText(on));
+    }, {"on", "off"});
+    add("Display", "lights", "[on|off]", "boat lamps and spotlight (L)", [&a, onOffText](const ConsoleArgs& args) {
+        bool on;
+        if (!a.console.onOff(args, a.boatLights, on)) return;
+        a.boatLights = on;
+        a.console.print("lights %s", onOffText(on));
+    }, {"on", "off"});
+    add("Display", "minimap", "[400|1000|2500]", "minimap range in metres (M cycles)", [&a](const ConsoleArgs& args) {
+        Console& c = a.console;
+        if (args.empty()) {
+            a.minimap->cycleZoom();
+        } else {
+            float v;
+            if (!c.number(args[0], v, "minimap")) return;
+            int best = 0;  // nearest of the three ranges
+            for (int i = 1; i < 3; ++i)
+                if (std::fabs(Minimap::kRanges[i] - v) < std::fabs(Minimap::kRanges[best] - v)) best = i;
+            a.minimap->setZoom(best);
+        }
+        c.print("minimap %.0f m", a.minimap->range());
+    }, {"400", "1000", "2500"});
+    add("Display", "reload", "", "reload shaders from disk (R)", [&a](const ConsoleArgs&) {
+        int failed = 0;
+        for (Shader* s : a.allShaders())
+            if (!s->reload()) ++failed;
+        if (failed) a.console.error("%d shader(s) failed to compile; the old ones are still in use (see terminal)", failed);
+        else a.console.print("Shaders reloaded");
+    });
+    add("Display", "screenshot", "[file.bmp]", "save the next frame, without the console (P)", [&a](const ConsoleArgs& args) {
+        std::string name = args.empty() ? nextShotName(a) : args[0];
+        if (name.size() < 4 || Console::lower(name.substr(name.size() - 4)) != ".bmp") name += ".bmp";
+        a.pendingShot = name;
+    });
+    add("Display", "stats", "", "frame rate, terrain chunks, triangles, props", [&a](const ConsoleArgs&) {
+        Console& c = a.console;
+        const ChunkStats& st = a.terrain->stats();
+        c.print("%.0f fps | chunks %d drawn / %d loaded, %d queued, %d building", a.fps, st.drawn, st.loaded, st.queued,
+                st.building);
+        c.print("%.2fM triangles | %zu props | %zu landmarks | view %.1f km", static_cast<double>(st.triangles) / 1e6, st.props,
+                a.landmarks.all().size(), a.terrain->viewDistance() / 1000.0f);
+    });
 }
 
 } // namespace
@@ -763,6 +1304,7 @@ int main(int argc, char** argv)
     glfwSwapInterval(1);
     glfwSetKeyCallback(app.window, onKey);
     glfwSetScrollCallback(app.window, onScroll);
+    glfwSetCharCallback(app.window, onChar);
     if (!gladLoadGL(glfwGetProcAddress)) {
         std::fprintf(stderr, "Failed to load OpenGL functions\n");
         glfwTerminate();
@@ -783,6 +1325,7 @@ int main(int argc, char** argv)
     app.beamShader      = load("beam.vert", "beam.frag");
     app.hudShader       = load("hud.vert", "hud.frag");
     app.minimapShader   = load("minimap.vert", "minimap.frag");
+    app.textShader      = load("text.vert", "text.frag");
     for (Shader* s : app.allShaders()) {
         if (!s->valid()) {
             std::fprintf(stderr, "Shader setup failed (is the shaders/ folder next to the exe?)\n");
@@ -796,6 +1339,7 @@ int main(int argc, char** argv)
     app.scene = std::make_unique<SceneTarget>();
     app.hud   = std::make_unique<Hud>();
     app.minimap = std::make_unique<Minimap>();
+    app.text    = std::make_unique<TextRenderer>();
     app.props = std::make_unique<PropRenderer>();
     app.boatMesh       = buildMesh([](MeshBuilder& m) { buildBoatModel(m); });
     app.lighthouseMesh = buildMesh(buildLighthouse);
@@ -806,6 +1350,17 @@ int main(int argc, char** argv)
     spawnBoat(app, 0.0, 0.0, app.opt.island);
     std::printf("Seed %u | terrain view %.1f km | ocean mesh %zu vertices\n",
                 app.opt.seed, app.terrain->viewDistance() / 1000.0f, app.ocean->vertexCount());
+
+    // Console: commands, then autoexec.cfg (if there is one in the working
+    // folder), then any --cmd / --exec from the command line, in order.
+    registerCommands(app);
+    app.console.heading("SeaSail console. Type help for commands; ` or Esc closes it.");
+    if (app.console.execFile("autoexec.cfg")) app.console.print("Ran autoexec.cfg");
+    for (const std::string& line : app.opt.startup) app.console.execute(line);
+    if (app.opt.console) {
+        app.console.setOpen(true);
+        app.console.update(1.0f);  // skip the slide-in
+    }
 
     // ---- screenshot / test mode -----------------------------------------------
     if (shotMode) {
@@ -850,6 +1405,8 @@ int main(int argc, char** argv)
         int fw, fh;
         glfwGetFramebufferSize(app.window, &fw, &fh);
         render(app, fw, fh);
+        if (app.console.isOpen())
+            drawConsole(app.console, *app.hud, *app.text, *app.hudShader, *app.textShader, fw, fh);
         glFinish();
         const ChunkStats& st = app.terrain->stats();
         std::printf("Streamed %d chunks in %.0f ms | drew %d chunks, %.2fM triangles, %zu props, %zu landmarks\n",
@@ -879,17 +1436,27 @@ int main(int argc, char** argv)
 
         int fw, fh;
         glfwGetFramebufferSize(app.window, &fw, &fh);
-        if (fw > 0 && fh > 0) render(app, fw, fh);
+        if (fw > 0 && fh > 0) {
+            render(app, fw, fh);
+            // Screenshots are taken here: a whole frame, before the console.
+            if (!app.pendingShot.empty()) {
+                if (saveBmp(app.pendingShot, fw, fh)) app.console.print("Saved %s", app.pendingShot.c_str());
+                else app.console.error("Could not write %s", app.pendingShot.c_str());
+                app.pendingShot.clear();
+            }
+            drawConsole(app.console, *app.hud, *app.text, *app.hudShader, *app.textShader, fw, fh);
+        }
         glfwSwapBuffers(app.window);
 
         ++frames;
         if (now - titleTimer >= 0.5) {
+            app.fps = static_cast<float>(frames / (now - titleTimer));
             const ChunkStats& st = app.terrain->stats();
             int hh = static_cast<int>(app.env.hours), mm = static_cast<int>((app.env.hours - hh) * 60.0f);
             char title[256];
             std::snprintf(title, sizeof(title),
                           "SeaSail | %.0f fps | %02d:%02d%s | %.1f kn | heading %03.0f | %.2f, %.2f km | chunks %d/%d | props %zu%s%s",
-                          frames / (now - titleTimer), hh, mm, app.env.paused ? " (paused)" : "",
+                          app.fps, hh, mm, app.env.paused ? " (paused)" : "",
                           std::fabs(app.boat.speed()) * 1.944f, bearingDegrees(app.boat.forward()),
                           app.boat.x() / 1000.0, app.boat.z() / 1000.0, st.drawn, st.loaded, st.props,
                           app.freeCam ? " | FREE CAMERA (V)" : "",

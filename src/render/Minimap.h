@@ -31,6 +31,8 @@ public:
     static constexpr float kRanges[3] = {400.0f, 1000.0f, 2500.0f};
 
     void cycleZoom() { zoom_ = (zoom_ + 1) % 3; }
+    void setZoom(int level) { zoom_ = level < 0 ? 0 : level > 2 ? 2 : level; }
+    int  zoom() const { return zoom_; }
     float range() const { return kRanges[zoom_]; }
 
     // Forget the chart (e.g. after generating a new world).

@@ -16,6 +16,19 @@ namespace sea {
 class IslandGenerator;
 class Ocean;
 
+// Handling. The console's `tune` command edits these live.
+struct BoatTuning {
+    float thrust     = 4.2f;    // m/s^2 at full throttle
+    float boostMul   = 1.7f;
+    float reverseMul = 0.45f;   // reverse is weaker
+    float linearDrag = 0.22f;   // 1/s
+    float quadDrag   = 0.035f;  // 1/m   -> top speed ~ 8 m/s (15 knots)
+    float sideGrip   = 2.8f;    // how fast sideways drift dies out (1/s)
+    float turnRate   = 0.95f;   // rad/s at speed
+    float idleTurn   = 0.35f;   // fraction of turnRate when stopped
+    float engineSpool = 2.5f;   // how fast the throttle responds (1/s)
+};
+
 struct BoatInput {
     float throttle = 0.0f;  // -1 (reverse) .. +1 (full ahead)
     float steer    = 0.0f;  // -1 (port / left) .. +1 (starboard / right)
@@ -31,7 +44,14 @@ struct WakePoint {
 
 class Boat {
 public:
+    BoatTuning tuning;
+    bool ghost = false;  // sail through land (testing)
+
     void placeAt(double x, double z, float heading);
+    // Teleport-free tweaks for testing: turn on the spot, or set the speed
+    // along the current heading (sideways drift is cleared).
+    void setHeading(float radians);
+    void setSpeed(float metresPerSecond);
     void update(const BoatInput& in, const Ocean& ocean, const IslandGenerator& world, double time, float dt);
 
     // World-space pose. Position is absolute (double); use transform() to get

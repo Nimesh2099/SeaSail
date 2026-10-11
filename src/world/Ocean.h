@@ -46,10 +46,17 @@ public:
 
     size_t vertexCount() const { return vertexCount_; }
 
+    // Scale every wave's height (1 = normal, 0 = flat calm, 2 = rough).
+    // The CPU surface uses the same waves, so the boat follows along.
+    void  setWaveScale(float scale);
+    float waveScale() const { return waveScale_; }
+
 private:
     void displacement(double x, double z, double time, double& dx, double& dy, double& dz) const;
 
     std::vector<Wave> waves_;
+    std::vector<Wave> baseWaves_;  // as designed, before scaling
+    float waveScale_ = 1.0f;
     GLuint vao_ = 0, vbo_ = 0, ebo_ = 0;
     GLsizei indexCount_ = 0;
     size_t vertexCount_ = 0;
