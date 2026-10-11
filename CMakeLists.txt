@@ -49,7 +49,8 @@ add_executable(SeaSail
     src/render/SceneTarget.cpp
     src/render/Hud.cpp
     src/render/PropRenderer.cpp
-    src/render/LandmarkModels.cpp)
+    src/render/LandmarkModels.cpp
+    src/render/Minimap.cpp)
 target_include_directories(SeaSail PRIVATE src src/core src/world src/game src/render)
 target_link_libraries(SeaSail PRIVATE glad glfw Threads::Threads)
 

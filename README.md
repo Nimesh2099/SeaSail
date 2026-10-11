@@ -47,11 +47,17 @@ cmake --build build -j
 | **[ / ]** | time of day back / forward | **T** | pause / resume the clock |
 | **L** | boat lights on / off | **V** | free camera (WASD, Space/C) |
 | **Backspace** | respawn next to an island | **N** | new world (new seed) |
-| **H** | hide HUD | | |
+| **M** | minimap zoom (400 m / 1 km / 2.5 km) | **H** | hide HUD |
 | **F** | wireframe | **R** | hot-reload shaders |
 | **P** | screenshot (.bmp) | **Esc** | quit |
 
-**HUD**: the compass shows north at the top. The white arrow is the boat's heading and the thin line is where the camera is looking. The small dial above it is the clock: the dot is the sun by day and the moon by night, with midnight at the bottom. The blue bar is speed, and turns amber while boosting. The last bar is the engine telegraph: up is ahead, down is astern.
+**HUD**:
+- **Minimap**, bottom left: a sea chart centred on your boat (the yellow arrow), with north up.
+  - Water is shaded by depth, with a pale line where it shelves to 10 m. Islands are shown with hill shading and dark coastlines.
+  - Lighthouses are red-and-white dots and jetties are brown marks. The faint line is where the camera is looking.
+  - The dots underneath show the zoom level.
+- **Clock**: the small dial is the time of day. The dot is the sun by day and the moon by night, with midnight at the bottom.
+- **Bars**: the blue bar is speed, and turns amber while boosting. The last bar is the engine telegraph: up is ahead, down is astern.
 
 A full day lasts 16 real minutes. The lamps come on at dusk.
 
@@ -110,6 +116,12 @@ Height is a pure function of world `(x, z)` in double precision. Nothing is stor
   - lighthouse lamps and the lanterns on the jetties and huts
 
   All surfaces share one `surfaceLight()` function (sun + moon + sky + point lights + spotlight). The water adds glittering reflections of every lamp.
+
+### Minimap (`Minimap.cpp`, `shaders/minimap.*`)
+- The chart is a 192×192 texture painted on the CPU straight from the island generator, the same function the 3D terrain uses.
+- Painting takes about 0.1 s, so it runs on a background thread (`std::async`). The old chart keeps being drawn, offset to the boat's position, until the new one is ready, so it never stalls a frame.
+- It's repainted when the boat nears the edge of the painted area or the zoom changes.
+- A shader cuts it into a circle, and the HUD draws the rim, ticks, icons and boat arrow on top.
 
 ### Anti-aliasing
 The off-screen scene gets **FXAA** in the composite pass. For each pixel it finds the local edge direction from the brightness of the four diagonal neighbours, then blurs only along that edge.
@@ -175,13 +187,13 @@ src/core/                 SeaMath.h (Vec3, Mat4, Quat), Camera, Noise, Shader (#
 src/world/                IslandGenerator, TerrainStreamer, Ocean, Props (placement), Landmarks
 src/game/                 Boat (handling), BoatModel (procedural mesh), ChaseCamera, Environment (time of day)
 src/render/               Mesh (+builder), PropRenderer (instancing + plant models), LandmarkModels,
-                          SceneTarget (HDR + distance), Frustum, Hud
-shaders/                  sky, terrain, props, object, water, beam, composite (FXAA), hud + shared common.glsl
+                          SceneTarget (HDR + distance), Frustum, Hud, Minimap
+shaders/                  sky, terrain, props, object, water, beam, composite (FXAA), hud, minimap + shared common.glsl
 external/glad/            OpenGL 3.3 core loader
 ```
 
 ## Ideas for next steps
-- Gameplay: dock at the jetties, fishing spots, a map that fills in as you explore.
+- Gameplay: dock at the jetties, fishing spots, a full-screen map that fills in as you explore.
 - Weather: wind that changes the waves, fog banks rolling in at night, rain.
 - Shadows (a shadow map from the sun) and grass close to the camera.
 - Spray particles at the bow, and sound.

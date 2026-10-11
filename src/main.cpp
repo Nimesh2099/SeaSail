@@ -8,7 +8,8 @@
 //   [ / ]        time of day back / forward    T         pause / resume the clock
 //   L            boat lights on / off          V         free camera on/off
 //   Backspace    respawn by an island          N         new world (new seed)
-//   H            hide HUD    F  wireframe      R         reload shaders
+//   M            minimap zoom                  H         hide HUD
+//   F            wireframe                     R         reload shaders
 //   P            screenshot (.bmp)             Esc       quit
 //
 // Command line (handy for testing and README images)
@@ -27,6 +28,7 @@
 #include "LandmarkModels.h"
 #include "Landmarks.h"
 #include "Mesh.h"
+#include "Minimap.h"
 #include "Ocean.h"
 #include "PropRenderer.h"
 #include "SceneTarget.h"
@@ -123,8 +125,9 @@ struct App {
     std::unique_ptr<BeamMesh>        beamMesh;
     std::unique_ptr<PropRenderer>    props;
     std::unique_ptr<Hud>             hud;
+    std::unique_ptr<Minimap>         minimap;
     std::unique_ptr<Shader> skyShader, terrainShader, objectShader, propShader, waterShader, compositeShader,
-                            beamShader, hudShader;
+                            beamShader, hudShader, minimapShader;
     GLuint emptyVao = 0;
 
     Landmarks   landmarks;
@@ -151,7 +154,7 @@ struct App {
     std::vector<Shader*> allShaders() const
     {
         return {skyShader.get(), terrainShader.get(), objectShader.get(), propShader.get(), waterShader.get(),
-                compositeShader.get(), beamShader.get(), hudShader.get()};
+                compositeShader.get(), beamShader.get(), hudShader.get(), minimapShader.get()};
     }
 };
 
@@ -215,7 +218,9 @@ void spawnBoat(App& a, double nearX, double nearZ, IslandType kind = IslandType:
 
 void rebuildWorld(App& a, uint32_t seed)
 {
-    a.terrain.reset();  // joins the worker threads before the world they read goes away
+    // Stop everything that reads the old world on other threads first.
+    if (a.minimap) a.minimap->reset();
+    a.terrain.reset();
     a.world = std::make_unique<IslandGenerator>(seed);
     a.terrain = std::make_unique<TerrainStreamer>(*a.world, a.opt.radius);
     a.landmarks = Landmarks();
@@ -261,6 +266,7 @@ void onKey(GLFWwindow* w, int key, int, int action, int)
     case GLFW_KEY_F:         a.wireframe = !a.wireframe; break;
     case GLFW_KEY_T:         a.env.paused = !a.env.paused; break;
     case GLFW_KEY_L:         a.boatLights = !a.boatLights; break;
+    case GLFW_KEY_M:         a.minimap->cycleZoom(); break;
     case GLFW_KEY_V:
         a.freeCam = !a.freeCam;
         if (!a.freeCam) a.chase.reset();
@@ -426,39 +432,67 @@ void setCommonUniforms(const Shader& s, const App& a)
 
 void drawHud(App& a, int w, int h)
 {
-    Hud& hud = *a.hud;
-    hud.begin();
     const float s = std::max(1.0f, static_cast<float>(h) / 720.0f);  // scale with resolution
-    const float cx = 92.0f * s, cy = 92.0f * s, r = 60.0f * s;
+    const float r = 80.0f * s, cx = r + 22.0f * s, cy = r + 22.0f * s;
     const Rgba white{1, 1, 1, 0.85f}, faint{1, 1, 1, 0.35f}, shade{0.02f, 0.05f, 0.07f, 0.45f};
 
-    // Compass: north (-z) is up, east (+x) is right.
-    auto toScreen = [](float wx, float wz) { return Vec3{wx, -wz, 0.0f}; };
-    hud.disc(cx, cy, r + 6.0f * s, shade);
+    // Minimap: the painted chart first, then everything drawn on top of it.
+    a.minimap->draw(*a.minimapShader, cx, cy, r, w, h, a.boat.x(), a.boat.z(), a.env.night());
+
+    Hud& hud = *a.hud;
+    hud.begin();
+    const float range = a.minimap->range();
+    // North (-z) is up, east (+x) is right. World offset -> pixels from centre.
+    auto toMap = [&](double dx, double dz) { return Vec3{static_cast<float>(dx) / range * r, -static_cast<float>(dz) / range * r, 0.0f}; };
+
+    // Lighthouses (red and white) and jetties (brown) within range.
+    for (const Landmark& lm : a.landmarks.all()) {
+        if (lm.kind == LandmarkKind::Hut) continue;
+        Vec3 p = toMap(lm.x - a.boat.x(), lm.z - a.boat.z());
+        if (p.x * p.x + p.y * p.y > (r - 6.0f * s) * (r - 6.0f * s)) continue;
+        if (lm.kind == LandmarkKind::Lighthouse) {
+            hud.disc(cx + p.x, cy + p.y, 4.5f * s, Rgba{1.0f, 1.0f, 1.0f, 0.95f}, 12);
+            hud.disc(cx + p.x, cy + p.y, 2.5f * s, Rgba{0.85f, 0.15f, 0.1f, 1.0f}, 12);
+        } else {
+            Vec3 d = toMap(std::cos(lm.yaw), std::sin(lm.yaw));   // jetty points out to sea
+            float l = std::sqrt(d.x * d.x + d.y * d.y);
+            if (l > 1e-4f) { d.x /= l; d.y /= l; }
+            hud.line(cx + p.x, cy + p.y, cx + p.x + d.x * 6.0f * s, cy + p.y + d.y * 6.0f * s, 3.0f * s, Rgba{0.45f, 0.30f, 0.15f, 1.0f});
+        }
+    }
+
+    // Rim: compass ticks with north in red.
     hud.ring(cx, cy, r, 2.0f * s, white);
     for (int i = 0; i < 8; ++i) {
         float ang = i * kPi / 4.0f;
-        float len = (i == 0 ? 14.0f : (i % 2 == 0 ? 9.0f : 5.0f)) * s;
+        float len = (i == 0 ? 12.0f : (i % 2 == 0 ? 8.0f : 4.0f)) * s;
         Rgba col = i == 0 ? Rgba{1.0f, 0.45f, 0.3f, 0.95f} : white;
         float dx = std::sin(ang), dy = std::cos(ang);
         hud.line(cx + dx * r, cy + dy * r, cx + dx * (r - len), cy + dy * (r - len), 2.0f * s, col);
     }
-    // Where the camera is looking.
+    // Where the camera is looking: a faint line from the boat.
     Vec3 cf = a.cam.forward();
-    Vec3 cv = toScreen(cf.x, cf.z);
+    Vec3 cv = toMap(cf.x, cf.z);
     float cl = std::sqrt(cv.x * cv.x + cv.y * cv.y);
-    if (cl > 1e-3f) hud.line(cx, cy, cx + cv.x / cl * r * 0.85f, cy + cv.y / cl * r * 0.85f, 1.5f * s, faint);
-    // Boat heading arrow.
+    if (cl > 1e-3f) hud.line(cx, cy, cx + cv.x / cl * r * 0.35f, cy + cv.y / cl * r * 0.35f, 1.5f * s, faint);
+    // The boat: a small arrow at the centre, pointing where it's heading.
     Vec3 bf = a.boat.forward();
-    Vec3 d = toScreen(bf.x, bf.z);
+    Vec3 d = toMap(bf.x, bf.z);
+    float dl = std::sqrt(d.x * d.x + d.y * d.y);
+    d.x /= dl; d.y /= dl;
     Vec3 n{-d.y, d.x, 0.0f};
-    float tipR = r * 0.78f, baseR = r * 0.30f, half = 9.0f * s;
-    hud.triangle(cx + d.x * tipR, cy + d.y * tipR,
-                 cx - d.x * baseR + n.x * half, cy - d.y * baseR + n.y * half,
-                 cx - d.x * baseR - n.x * half, cy - d.y * baseR - n.y * half, white);
+    const float tip = 9.0f * s, back = 5.0f * s, half = 5.5f * s;
+    hud.triangle(cx + d.x * tip, cy + d.y * tip,
+                 cx - d.x * back + n.x * half, cy - d.y * back + n.y * half,
+                 cx - d.x * back - n.x * half, cy - d.y * back - n.y * half, Rgba{1.0f, 0.85f, 0.3f, 1.0f});
+    // Zoom indicator: one to three dots under the map.
+    for (int z = 0; z < 3; ++z) {
+        bool on = a.minimap->range() >= Minimap::kRanges[z];
+        hud.disc(cx - 8.0f * s + z * 8.0f * s, cy - r - 9.0f * s, 2.5f * s, on ? white : faint, 8);
+    }
 
-    // Clock: a small dial above the compass; the dot is the sun by day, the moon by night.
-    const float kx = cx, ky = cy + r + 30.0f * s, kr = 14.0f * s;
+    // Clock: a small dial above the map; the dot is the sun by day, the moon by night.
+    const float kx = cx + r - 8.0f * s, ky = cy + r + 4.0f * s, kr = 14.0f * s;
     hud.disc(kx, ky, kr + 3.0f * s, shade);
     hud.ring(kx, ky, kr, 1.5f * s, faint);
     float ang = (a.env.hours / 24.0f) * 2.0f * kPi;           // midnight at the bottom
@@ -640,6 +674,7 @@ void render(App& a, int fbW, int fbH)
 void shutdown(App& a)
 {
     // GL objects must be freed while the context still exists.
+    a.minimap.reset();   // waits for any chart still painting from the world
     a.terrain.reset();
     a.world.reset();
     a.ocean.reset();
@@ -659,6 +694,7 @@ void shutdown(App& a)
     a.compositeShader.reset();
     a.beamShader.reset();
     a.hudShader.reset();
+    a.minimapShader.reset();
     if (a.emptyVao) glDeleteVertexArrays(1, &a.emptyVao);
     glfwTerminate();
 }
@@ -671,6 +707,7 @@ void printControls()
         "  Shift      boost                       Mouse      orbit camera   Wheel  zoom\n"
         "  [ / ]      time of day back / forward  T          pause / resume the clock\n"
         "  L          boat lights on / off        V          free camera\n"
+        "  M          minimap zoom\n"
         "  Backspace  respawn by an island        N          new world\n"
         "  Tab        release/capture mouse       H          hide HUD       F  wireframe\n"
         "  R          reload shaders              P          screenshot     Esc  quit\n\n");
@@ -745,6 +782,7 @@ int main(int argc, char** argv)
     app.compositeShader = load("fullscreen.vert", "composite.frag");
     app.beamShader      = load("beam.vert", "beam.frag");
     app.hudShader       = load("hud.vert", "hud.frag");
+    app.minimapShader   = load("minimap.vert", "minimap.frag");
     for (Shader* s : app.allShaders()) {
         if (!s->valid()) {
             std::fprintf(stderr, "Shader setup failed (is the shaders/ folder next to the exe?)\n");
@@ -757,6 +795,7 @@ int main(int argc, char** argv)
     app.ocean = std::make_unique<Ocean>();
     app.scene = std::make_unique<SceneTarget>();
     app.hud   = std::make_unique<Hud>();
+    app.minimap = std::make_unique<Minimap>();
     app.props = std::make_unique<PropRenderer>();
     app.boatMesh       = buildMesh([](MeshBuilder& m) { buildBoatModel(m); });
     app.lighthouseMesh = buildMesh(buildLighthouse);
@@ -801,6 +840,11 @@ int main(int argc, char** argv)
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         app.terrain->uploadFinished(1000.0);
+        app.minimap->update(*app.world, app.boat.x(), app.boat.z());
+        for (int i = 0; i < 400; ++i) {   // let the chart finish painting
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            app.minimap->update(*app.world, app.boat.x(), app.boat.z());
+        }
         double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
         int fw, fh;
@@ -831,6 +875,7 @@ int main(int argc, char** argv)
         app.terrain->update(camWorldX(app), app.cam.position.y, camWorldZ(app));
         app.terrain->uploadFinished(3.0);  // ms per frame for GPU uploads
         app.landmarks.update(*app.world, camWorldX(app), camWorldZ(app));
+        app.minimap->update(*app.world, app.boat.x(), app.boat.z());
 
         int fw, fh;
         glfwGetFramebufferSize(app.window, &fw, &fh);
