@@ -18,7 +18,7 @@
 // Command line (handy for testing and README images)
 //   SeaSail [--seed N] [--radius CHUNKS] [--width W --height H] [--hour 0..24]
 //           [--view chase|side|high|low|cove] [--simulate SECONDS] [--steer -1..1]
-//           [--island mountain|atoll|stacks|cay] [--time SECONDS] [--shot out.bmp]
+//           [--island mountain|atoll|stacks|cay] [--time SECONDS] [--shot out.bmp] [--erosion 0|1]
 //           [--cmd "console commands"] [--exec file.cfg] [--console]
 //           [--fullscreen] [--scale 0.25..1] [--msaa 0|2|4|8] [--bench FRAMES]
 
@@ -90,6 +90,7 @@ struct Options {
     double      time     = 30.0;   // start time (waves, caustics)
     float       hour     = 10.0f;  // start time of day
     IslandType  island   = IslandType::Mountain;  // kind of island to start next to
+    bool        erosion  = true;       // hydraulic erosion on mountain islands
     std::vector<std::string> startup;  // console lines to run at start ("exec file" for --exec)
     bool        console  = false;      // start with the console open
     int         bench    = 0;          // with --shot: time this many frames and print a report
@@ -120,6 +121,7 @@ Options parseArgs(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--scale"))    o.scale    = static_cast<float>(std::atof(next()));
         else if (!std::strcmp(argv[i], "--fullscreen")) o.fullscreen = true;
         else if (!std::strcmp(argv[i], "--msaa"))     o.msaa     = std::atoi(next());
+        else if (!std::strcmp(argv[i], "--erosion"))  o.erosion  = std::atoi(next()) != 0;
         else if (!std::strcmp(argv[i], "--island")) {
             std::string t = next();
             o.island = t == "atoll" ? IslandType::Atoll : t == "stacks" ? IslandType::SeaStacks
@@ -274,7 +276,7 @@ void rebuildWorld(App& a, uint32_t seed)
     // Stop everything that reads the old world on other threads first.
     if (a.minimap) a.minimap->reset();
     a.terrain.reset();
-    a.world = std::make_unique<IslandGenerator>(seed);
+    a.world = std::make_unique<IslandGenerator>(seed, a.opt.erosion);
     a.terrain = std::make_unique<TerrainStreamer>(*a.world, a.opt.radius);
     a.landmarks = Landmarks();
 }
@@ -291,6 +293,21 @@ void applyView(App& a, const std::string& view)
         a.chase.yaw = h + kPi * 1.15f; a.chase.pitch = 0.18f; a.chase.distance = 18.0f;
     } else if (view == "cove") {
         a.chase.yaw = h - kPi * 0.6f; a.chase.pitch = 0.45f; a.chase.distance = 26.0f;
+    } else if (view == "aerial") {
+        // Free camera hanging off the nearest island, looking across it:
+        // the view for before/after erosion comparisons.
+        IslandInfo is = a.world->nearestIsland(a.boat.x(), a.boat.z());
+        if (is.type == IslandType::None) return;
+        // A fixed direction (from the south-west, like the boat's spawn),
+        // so the shot is identical with erosion on and off.
+        const double dx = -0.8, dz = 0.6;
+        double camX = is.cx + dx * is.radius * 1.15, camZ = is.cz + dz * is.radius * 1.15;
+        a.freeCam = true;
+        a.originX = std::floor(camX / kRebaseStep) * kRebaseStep;
+        a.originZ = std::floor(camZ / kRebaseStep) * kRebaseStep;
+        a.cam.position = toLocal(a, camX, is.radius * 0.55f + 60.0f, camZ);
+        a.cam.lookAt(toLocal(a, is.cx, is.peak * 0.25f, is.cz), {0, 1, 0});
+        return;
     } else { // chase
         a.chase.yaw = h + kPi; a.chase.pitch = 0.45f; a.chase.distance = 16.0f;
     }
@@ -1360,6 +1377,19 @@ void registerCommands(App& a)
         c.print("seed %u", a.world->seed());
     });
     add("World", "newworld", "", "a new world from a random seed (N)", [&a](const ConsoleArgs&) { newWorld(a); });
+    add("World", "erosion", "[on|off]", "hydraulic erosion on mountain islands (rebuilds the world)",
+        [&a](const ConsoleArgs& args) {
+            bool on;
+            if (!a.console.onOff(args, a.opt.erosion, on)) return;
+            if (on != a.opt.erosion) {
+                a.opt.erosion = on;
+                double bx = a.boat.x(), bz = a.boat.z();
+                float hdg = a.boat.heading();
+                rebuildWorld(a, a.world->seed());
+                teleport(a, bx, bz, hdg);   // same spot, so you can compare
+            }
+            a.console.print("erosion %s", on ? "on" : "off");
+        }, {"on", "off"});
     add("World", "viewdist", "[chunks]", "terrain view radius in 128 m chunks (8..64)", [&a](const ConsoleArgs& args) {
         Console& c = a.console;
         if (!args.empty()) {
@@ -1421,11 +1451,11 @@ void registerCommands(App& a)
 
     // ---- Camera ------------------------------------------------------------
     add("Camera", "view", "<preset>", "camera preset around the boat", [&a](const ConsoleArgs& args) {
-        if (args.empty()) { a.console.error("usage: view chase|side|high|low|cove"); return; }
+        if (args.empty()) { a.console.error("usage: view chase|side|high|low|cove|aerial"); return; }
         a.freeCam = false;
         applyView(a, Console::lower(args[0]));
         a.console.print("view %s", args[0].c_str());
-    }, {"chase", "side", "high", "low", "cove"});
+    }, {"chase", "side", "high", "low", "cove", "aerial"});
     add("Camera", "freecam", "[on|off]", "fly the camera freely (V)", [&a, onOffText](const ConsoleArgs& args) {
         bool on;
         if (!a.console.onOff(args, a.freeCam, on)) return;

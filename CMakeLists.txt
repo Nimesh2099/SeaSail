@@ -38,6 +38,7 @@ add_executable(SeaSail
     src/core/Screenshot.cpp
     src/core/Console.cpp
     src/world/IslandGenerator.cpp
+    src/world/Erosion.cpp
     src/world/TerrainStreamer.cpp
     src/world/Ocean.cpp
     src/world/Props.cpp

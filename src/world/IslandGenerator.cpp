@@ -1,9 +1,16 @@
 #include "IslandGenerator.h"
 
+#include "Erosion.h"
 #include "SeaMath.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cmath>
+#include <future>
+#include <mutex>
+#include <unordered_map>
 
 namespace sea {
 
@@ -42,7 +49,119 @@ struct SharedFields {
 
 } // namespace
 
-IslandGenerator::IslandGenerator(uint32_t seed) : seed_(seed), noise_(seed) {}
+// ---------------------------------------------------------------- erosion --
+//
+// Eroded islands, computed on first use and shared by every thread. The
+// first thread to need an island computes it; others needing the same island
+// meanwhile wait on the same future instead of doing the work twice.
+
+namespace {
+
+constexpr double kErosionReach = 1.45;   // grid half-size / island radius (see Erosion.cpp)
+constexpr size_t kMaxCachedIslands = 48; // ~1.2 MB each
+
+bool erodes(const IslandInfo& is) { return is.type == IslandType::Mountain; }
+
+std::atomic<uint64_t> g_nextGeneratorId{1};
+
+} // namespace
+
+struct IslandGenerator::ErosionCache {
+    using MapPtr = std::shared_ptr<const ErosionMap>;
+    struct Entry {
+        std::shared_future<MapPtr> map;
+        uint64_t lastUse = 0;
+    };
+    std::mutex mutex;
+    std::unordered_map<uint64_t, Entry> entries;
+    uint64_t clock = 0;
+
+    static uint64_t key(int64_t cx, int64_t cz)
+    {
+        return (static_cast<uint64_t>(cx) * 0x9E3779B97F4A7C15ULL) ^ static_cast<uint64_t>(cz);
+    }
+};
+
+IslandGenerator::IslandGenerator(uint32_t seed, bool erosion)
+    : seed_(seed), erosion_(erosion), id_(g_nextGeneratorId++), noise_(seed), cache_(std::make_unique<ErosionCache>())
+{
+}
+
+IslandGenerator::~IslandGenerator() = default;
+
+TerrainSample IslandGenerator::sample(double x, double z) const
+{
+    TerrainSample s = baseSample(x, z);
+    if (!erosion_) return s;
+
+    const int64_t ccx = static_cast<int64_t>(std::floor(x / kCellSize));
+    const int64_t ccz = static_cast<int64_t>(std::floor(z / kCellSize));
+    for (int64_t dz = -1; dz <= 1; ++dz)
+        for (int64_t dx = -1; dx <= 1; ++dx) {
+            const int64_t cx = ccx + dx, cz = ccz + dz;
+            IslandInfo is = islandInCell(cx, cz);
+            if (!erodes(is)) continue;
+            const double reach = is.radius * kErosionReach;
+            if (std::fabs(x - is.cx) >= reach || std::fabs(z - is.cz) >= reach) continue;
+
+            // Each thread remembers the last few islands it used, so the
+            // shared cache (and its lock) is only touched when moving on to
+            // another island, not for every one of the millions of samples.
+            struct Recent { uint64_t owner = 0; int64_t cx = 0, cz = 0; ErosionCache::MapPtr map; };
+            thread_local Recent recent[4];
+            thread_local int next = 0;
+            ErosionCache::MapPtr map;
+            for (const Recent& r : recent)
+                if (r.owner == id_ && r.cx == cx && r.cz == cz) { map = r.map; break; }
+
+            if (!map) {
+                std::shared_future<ErosionCache::MapPtr> fut;
+                std::promise<ErosionCache::MapPtr> promise;
+                bool mine = false;
+                {
+                    std::lock_guard<std::mutex> lock(cache_->mutex);
+                    auto& entries = cache_->entries;
+                    const uint64_t k = ErosionCache::key(cx, cz);
+                    auto it = entries.find(k);
+                    if (it == entries.end()) {
+                        // Make room: forget the island used longest ago.
+                        if (entries.size() >= kMaxCachedIslands) {
+                            auto oldest = entries.begin();
+                            for (auto e = entries.begin(); e != entries.end(); ++e)
+                                if (e->second.lastUse < oldest->second.lastUse) oldest = e;
+                            entries.erase(oldest);
+                        }
+                        fut = promise.get_future().share();
+                        it = entries.emplace(k, ErosionCache::Entry{fut, 0}).first;
+                        mine = true;
+                    }
+                    it->second.lastUse = ++cache_->clock;
+                    fut = it->second.map;
+                }
+                if (mine) {
+                    auto t0 = std::chrono::steady_clock::now();
+                    auto base = [this](double bx, double bz) { return baseSample(bx, bz).height; };
+                    auto eroded = std::make_shared<const ErosionMap>(erodeIsland(is, base, seed_));
+                    double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    auto [lo, hi] = std::minmax_element(eroded->dh.begin(), eroded->dh.end());
+                    std::printf("Eroded island at (%.0f, %.0f), radius %.0f m, in %.2f s: cut up to %.1f m, filled up to %.1f m\n",
+                                is.cx, is.cz, is.radius, secs, -*lo, *hi);
+                    promise.set_value(std::move(eroded));
+                }
+                map = fut.get();
+                recent[next] = {id_, cx, cz, map};
+                next = (next + 1) % 4;
+            }
+
+            float dh, flow;
+            if (map->lookup(x, z, dh, flow)) {
+                s.height += dh;
+                // Valleys where the water ran stay greener.
+                s.moisture = clampf(s.moisture + flow * 0.3f, 0.0f, 1.0f);
+            }
+        }
+    return s;
+}
 
 IslandInfo IslandGenerator::islandInCell(int64_t cx, int64_t cz) const
 {
@@ -103,7 +222,7 @@ IslandInfo IslandGenerator::nearestIsland(double x, double z, IslandType wanted,
     return best;
 }
 
-TerrainSample IslandGenerator::sample(double x, double z) const
+TerrainSample IslandGenerator::baseSample(double x, double z) const
 {
     const GradientNoise& n = noise_;
     SharedFields f;

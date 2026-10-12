@@ -10,6 +10,7 @@
 #include "Noise.h"
 
 #include <cstdint>
+#include <memory>
 
 namespace sea {
 
@@ -38,8 +39,15 @@ class IslandGenerator {
 public:
     static constexpr double kCellSize = 1500.0;  // at most one island per cell
 
-    explicit IslandGenerator(uint32_t seed);
+    // erosion = false gives the raw shapes (for before/after comparisons).
+    explicit IslandGenerator(uint32_t seed, bool erosion = true);
+    ~IslandGenerator();
+    IslandGenerator(const IslandGenerator&) = delete;
+    IslandGenerator& operator=(const IslandGenerator&) = delete;
 
+    // Height and moisture at a point, erosion included. The first request
+    // near a not-yet-eroded island runs its erosion (a fraction of a second,
+    // usually on a terrain worker thread); the result is cached.
     TerrainSample sample(double x, double z) const;
     float height(double x, double z) const { return sample(x, z).height; }
 
@@ -49,10 +57,18 @@ public:
     IslandInfo nearestIsland(double x, double z, IslandType wanted = IslandType::None, int maxRings = 8) const;
 
     uint32_t seed() const { return seed_; }
+    bool erosion() const { return erosion_; }
 
 private:
+    // The terrain before erosion: a pure function of (x, z).
+    TerrainSample baseSample(double x, double z) const;
+
+    struct ErosionCache;
     uint32_t      seed_;
+    bool          erosion_;
+    uint64_t      id_;      // tells this world's cached islands from a previous world's
     GradientNoise noise_;
+    std::unique_ptr<ErosionCache> cache_;
 };
 
 } // namespace sea

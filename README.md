@@ -73,9 +73,9 @@ Press **`** (the key left of 1) or **F1** to open it. The game ignores the keybo
 | Group | Commands |
 | --- | --- |
 | Boat | `tp <x> <z>`, `tp island [mountain\|atoll\|stacks\|cay]`, `pos`, `heading <deg>`, `speed [m/s]`, `ghost [on\|off]`, `tune [name value\|reset]`, `respawn` |
-| World | `seed [n]`, `newworld`, `viewdist [chunks]`, `waves [0..3]`, `fog [density\|reset]` |
+| World | `seed [n]`, `newworld`, `erosion [on\|off]`, `viewdist [chunks]`, `waves [0..3]`, `fog [density\|reset]` |
 | Time | `time [hh[:mm]]`, `pause [on\|off]`, `daylength [minutes]` |
-| Camera | `view chase\|side\|high\|low\|cove`, `freecam [on\|off]`, `fov [deg]`, `zoom [m]` |
+| Camera | `view chase\|side\|high\|low\|cove\|aerial`, `freecam [on\|off]`, `fov [deg]`, `zoom [m]` |
 | Display | `hud`, `wireframe`, `lights`, `minimap [400\|1000\|2500]`, `reload`, `screenshot [file]`, `stats` |
 | Performance | `perf [on\|off\|report]`, `renderscale [0.25..1\|auto]`, `vsync [on\|off]`, `fullscreen [on\|off]` |
 | General | `help`, `clear`, `echo`, `exec <file>`, `quit` |
@@ -111,6 +111,7 @@ SeaSail --console                         # start with the console open (also sh
 SeaSail --fullscreen --scale 0.75         # fullscreen, 3D view at 75% resolution (default: auto)
 SeaSail --msaa 0                          # no MSAA on the window (cheaper on weak GPUs)
 SeaSail --shot out.bmp --bench 60         # time 60 frames and print GPU ms per render pass
+SeaSail --erosion 0 --view aerial --shot before.bmp   # an island without erosion, from the air
 ```
 
 ---
@@ -127,6 +128,29 @@ Height is a pure function of world `(x, z)` in double precision. Nothing is stor
   - **Cays**: small, flat, sandy islets.
 - **Coastlines**: a domain warp bends each island's circular outline into bays and headlands.
 - **Beaches**: `h − 0.6·b·tanh(h/b)` squashes heights near sea level, so beaches come out wide and flat.
+
+### Hydraulic erosion (`Erosion.cpp`)
+| Before | After |
+|---|---|
+| ![Before erosion](docs/erosion_before.jpg) | ![After erosion](docs/erosion_after.jpg) |
+
+Mountain islands are worn down by simulated rain, which carves branching gullies, sharp ridges and valley floors.
+- **Cached per island**: the base terrain is a pure function of position, but erosion is a simulation, because every droplet changes the ground for the next. So each island is eroded once, on a 384×384 grid, the first time anything needs it (0.3–0.5 s, on a terrain worker thread). The change in height is cached and added to the base terrain.
+- **The droplets**: roughly 100,000 per island.
+  - Each runs downhill with a little inertia, gaining speed on steep ground and slowly evaporating.
+  - It can carry more sediment the faster and steeper it goes: `capacity = max(-dh, minSlope) × speed × water × k`.
+  - When it carries less than it could, it erodes the ground with a soft brush; when it carries more, it drops some.
+  - At the sea it leaves part of its load as a beach or delta, and the rest washes away.
+- **Seamless**:
+  - The change fades to zero at the grid's edge and on the sea floor.
+  - Sheer sea cliffs are left alone, since rain doesn't shape those.
+  - Lookups use a cubic B-spline, so the lit terrain shows no grid lines.
+- **Greener valleys**: where the water ran is recorded too, and those cells become moister, so valley floors grow greener.
+- **Threads**:
+  - The first thread to need an island computes it, and others needing the same island wait on the same `std::shared_future`.
+  - Each thread remembers its last few islands, so the shared cache's lock is rarely touched.
+  - The cache keeps the 48 most recently used islands.
+- **Toggling**: `erosion off` in the console, or `--erosion 0`, shows the raw shapes. `view aerial` frames the nearest island for comparisons.
 
 ### Trees, rocks and gulls (`Props.cpp`, `PropRenderer.cpp`)
 - **Five kinds of plants and rocks**, modelled in code: curved palms with drooping fronds and coconuts, broadleaf trees, pines, bushes and lumpy rocks.
@@ -260,7 +284,7 @@ GPU floats jitter a few km from (0, 0). Everything is therefore drawn relative t
 src/main.cpp              window, input, game loop, render passes, HUD, console commands, test mode
 src/core/                 SeaMath.h (Vec3, Mat4, Quat), Camera, Noise, Shader (#include, hot reload), Screenshot,
                           Console (commands, history, completion)
-src/world/                IslandGenerator, TerrainStreamer, Ocean, Props (placement), Landmarks
+src/world/                IslandGenerator, Erosion, TerrainStreamer, Ocean, Props (placement), Landmarks
 src/game/                 Boat (handling), BoatModel (procedural mesh), ChaseCamera, Environment (time of day)
 src/render/               Mesh (+builder), PropRenderer (instancing + plant models), LandmarkModels,
                           SceneTarget (HDR + distance), Frustum, Hud, Minimap, TextRenderer (+ Font8x8.h),
