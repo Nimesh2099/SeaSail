@@ -1,8 +1,9 @@
 
 # SeaSail
 
-Preview:
-https://youtu.be/OqiDfUysCDo
+![Sailing past an atoll](docs/demo.gif)
+
+*Sailing along an atoll's reef. Rendered by the game's own test mode (`--simulate` + `--shot`), one frame per run. Full video: https://youtu.be/OqiDfUysCDo*
 
 An endless ocean full of procedurally generated islands that you explore in a small fishing boat. It's written from scratch in **C++17 and OpenGL 3.3**, with no engine, no math library and no art assets: the terrain, waves, trees, buildings, boat and camera are all code. The handling and camera take their cue from *Dredge*.
 
@@ -117,6 +118,55 @@ SeaSail --erosion 0 --view aerial --shot before.bmp   # an island without erosio
 ---
 
 ## How it works
+
+### Architecture
+Everything in the world comes from one seed and one pure height function. Nothing about the terrain is saved: chunks, props, landmarks, the minimap and the boat's grounding all ask the same `IslandGenerator` for heights, so they always agree.
+
+```mermaid
+flowchart TB
+    seed([World seed]) --> gen
+
+    subgraph world["World generation (src/world)"]
+        gen["IslandGenerator<br/>pure height(x, z)<br/>1.5 km cells, 4 island types"]
+        ero["Erosion<br/>~100k droplets per island<br/>cached, shared_future"]
+        props["Props<br/>one spot per 4 m cell<br/>height / slope / moisture rules"]
+        marks["Landmarks<br/>lighthouses, jetties"]
+        stream["TerrainStreamer<br/>worker threads<br/>128 m chunks, LOD 1–32 m"]
+        ocean["Ocean<br/>6 Gerstner waves<br/>same maths on CPU and GPU"]
+        ero -- "height delta" --> gen
+        gen --> stream
+        gen --> props
+        gen --> marks
+        props --> stream
+    end
+
+    subgraph game["Game (src/game)"]
+        boat["Boat<br/>buoyancy, drag, grounding"]
+        cam["ChaseCamera<br/>Dredge-style orbit"]
+        env["Environment<br/>sun, moon, time of day"]
+        boat --> cam
+    end
+
+    ocean -- "surface height + slope" --> boat
+    gen -- "sea-floor height" --> boat
+
+    subgraph render["Rendering (src/render + shaders)"]
+        scene["SceneTarget (HDR + distance)<br/>terrain, instanced props,<br/>landmarks, boat, sky"]
+        comp["Composite<br/>ACES tone map + FXAA"]
+        water["Water pass<br/>reads scene colour + depth"]
+        beams["Lighthouse beams"]
+        hud["HUD, Minimap, Console"]
+        scene --> comp --> water --> beams --> hud
+    end
+
+    stream -- "mesh uploads<br/>3 ms/frame budget" --> scene
+    marks --> scene
+    boat --> scene
+    cam --> scene
+    env --> scene
+    ocean --> water
+    gen -- "async CPU paint" --> hud
+```
 
 ### Islands from a pure function (`src/world/IslandGenerator.cpp`)
 Height is a pure function of world `(x, z)` in double precision. Nothing is stored, so the world is endless and costs no memory, and any piece of it can be built on any thread.
