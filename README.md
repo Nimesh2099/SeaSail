@@ -329,12 +329,62 @@ GPU floats jitter a few km from (0, 0). Everything is therefore drawn relative t
 
 ---
 
+## Evaluation: expressive range of the island generator
+What can the generator actually produce, and what does erosion change? Following the expressive range method (Smith & Whitehead, *Analyzing the Expressive Range of a Level Generator*, PCG Workshop 2010), I generated **998 islands from 25 seeds** (every island in an 8×8 block of cells per seed). I measured each one twice, with and without erosion, on a 4 m grid. Because the terrain is a pure function, this runs without a window or GPU.
+
+**Metrics** (all on land above sea level):
+- **Land area** and **peak height**
+- **Mean slope**, and the **share of land steeper than 35°**
+- **Ruggedness**: the mean height step from a sample to its 8 neighbours (terrain ruggedness index)
+- **Coast index**: coastline length ÷ circumference of a circle with the same area (1 = round; higher = more broken, or several pieces)
+
+![Expressive range by island type](docs/analysis/fig1_expressive_range.png)
+
+Mountains and sea stacks form clearly separate clusters. Cays and atolls overlap in size and height, but not in shape: their coast index is 1.02 versus 4.28, because atolls are broken rings around a lagoon (see the table). Mountain islands cover the widest range, about 24× in area and 11× in peak height.
+
+![Mountain islands heatmap](docs/analysis/fig2_mountain_heatmap.png)
+
+Within mountain islands, steepness and ruggedness rise together but spread widely: islands with the same share of steep land can differ in ruggedness by up to about 1 m.
+
+![Effect of erosion](docs/analysis/fig3_erosion_effect.png)
+
+**Erosion carves valleys but keeps the summits.** Comparing each mountain island with and without erosion, mean land height falls by a median **18%** while peaks drop under **2%**. Ruggedness rises on 81% of islands, and land area grows about 3% because sediment is dropped at the coast.
+
+| Type | Islands | Land area (m², median) | Peak (m, median) | Mean slope (°) | Ruggedness (m) | Coast index |
+|---|---|---|---|---|---|---|
+| Mountain | 534 | 256,950 | 78.6 | 23.0 | 1.55 | 1.09 |
+| Atoll | 127 | 34,500 | 1.9 | 6.7 | 0.38 | 4.28 |
+| Sea stacks | 178 | 9,450 | 32.5 | 59.1 | 9.32 | 5.39 |
+| Cay | 159 | 16,600 | 1.6 | 2.4 | 0.13 | 1.02 |
+
+| Erosion change (mountain islands) | Median | Middle 50% | Islands where it rose |
+|---|---|---|---|
+| Mean land height | -18.0% | -23.8% to -15.4% | 0% |
+| Peak height | -1.8% | -2.5% to -1.2% | 0% |
+| Land area | +3.2% | +0.0% to +7.0% | 63% |
+| Mean slope | +3.4% | -0.2% to +8.8% | 65% |
+| Ruggedness | +9.4% | +2.3% to +14.9% | 81% |
+| Land steeper than 35° | +16.9% | +0.0% to +54.4% | 70% |
+
+Cost: sampling one mountain island at 4 m takes a median 31 ms raw and 263 ms with erosion, which includes the one-off erosion run.
+
+**Limitations:** each island is measured on its own disc, and points nearer another island's centre are left out. Two atolls still pick up part of a neighbouring island (the two orange points among the taller islands in the first chart). The metrics describe shape, not how interesting an island is to sail around, which would need a player study.
+
+**Reproduce it:**
+```bash
+cmake --build build --config Release --target ExpressiveRange
+./build/ExpressiveRange --seeds 25 --cells 8 --out analysis/expressive_range.csv    # ~3.5 min
+python tools/plot_expressive_range.py analysis/expressive_range.csv docs/analysis    # needs pandas + matplotlib
+```
+The raw data is in `analysis/expressive_range.csv`, with one row per island and erosion setting.
+
 ## Code layout
 ```
 src/main.cpp              window, input, game loop, render passes, HUD, console commands, test mode
 src/core/                 SeaMath.h (Vec3, Mat4, Quat), Camera, Noise, Shader (#include, hot reload), Screenshot,
                           Console (commands, history, completion)
 src/world/                IslandGenerator, Erosion, TerrainStreamer, Ocean, Props (placement), Landmarks
+tools/                    ExpressiveRange (headless island metrics → CSV), plot_expressive_range.py (charts)
 src/game/                 Boat (handling), BoatModel (procedural mesh), ChaseCamera, Environment (time of day)
 src/render/               Mesh (+builder), PropRenderer (instancing + plant models), LandmarkModels,
                           SceneTarget (HDR + distance), Frustum, Hud, Minimap, TextRenderer (+ Font8x8.h),

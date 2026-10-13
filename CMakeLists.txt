@@ -72,3 +72,15 @@ endif()
 add_custom_command(TARGET SeaSail POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_SOURCE_DIR}/shaders $<TARGET_FILE_DIR:SeaSail>/shaders)
+
+# --- Expressive range analysis (no window or GPU; see "Evaluation" in README.md) ---
+add_executable(ExpressiveRange
+    tools/expressive_range.cpp
+    src/core/Noise.cpp
+    src/world/IslandGenerator.cpp
+    src/world/Erosion.cpp)
+target_include_directories(ExpressiveRange PRIVATE src/core src/world)
+target_link_libraries(ExpressiveRange PRIVATE Threads::Threads)
+if(MSVC)
+    target_compile_definitions(ExpressiveRange PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+endif()
