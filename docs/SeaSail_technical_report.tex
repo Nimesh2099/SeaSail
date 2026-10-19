@@ -1,0 +1,106 @@
+\documentclass[10pt,twocolumn]{article}
+\usepackage[letterpaper,margin=0.75in,columnsep=0.28in]{geometry}
+\usepackage{mathptmx}
+\usepackage[T1]{fontenc}
+\usepackage{microtype,booktabs,graphicx,xcolor}
+\usepackage[font=small,labelfont=bf,skip=4pt]{caption}
+\usepackage[colorlinks,urlcolor=blue!60!black,citecolor=black,linkcolor=black]{hyperref}
+\setlength{\parskip}{0pt}
+\urlstyle{same}
+\title{\vspace{-0.6in}\Large\bfseries Measuring the Expressive Range of a Procedural Island Generator with Hydraulic Erosion}
+\author{Nimeshkumar Chaudhari\\\small Kitchener, ON, Canada \textperiodcentered{} \href{mailto:nimeshchaudhari202@gmail.com}{nimeshchaudhari202@gmail.com} \textperiodcentered{} \url{https://github.com/Nimesh2099/SeaSail}}
+\date{\small Technical report, October 2026}
+\begin{document}
+\maketitle
+\begin{abstract}
+\noindent SeaSail is a real-time C++/OpenGL world of endless ocean and procedurally generated islands. Its terrain is a pure function of position and seed, refined per island by particle-based hydraulic erosion. This report asks what the generator can actually produce and what erosion changes. Using expressive range analysis, I generated 998 islands from 25 seeds and measured each one with and without erosion on a 4\,m grid. The four island types occupy distinct regions of the size--height space, with cays and atolls separated by coastline shape rather than size. On 534 mountain islands, erosion lowers mean land height by a median 18\% while peaks fall by under 2\%, and it raises ruggedness on 81\% of islands. Code, data and figures are public and reproducible.
+\end{abstract}
+
+\section{Introduction}
+Procedural content generation (PCG) lets a small team build worlds far larger than they could author by hand~\cite{shaker}. The cost is that nobody sees most of the output. A developer tunes a generator by flying around a few seeds, which says little about the thousands of islands a player may meet. Expressive range analysis addresses this by generating many outputs, measuring each one, and plotting their distribution~\cite{smith}.
+
+This report applies that method to SeaSail, an infinite ocean I built from scratch in C++17 and OpenGL~3.3. Its contributions are:
+(1)~a deterministic island generator with four island types and cached hydraulic erosion, running in real time with multithreaded streaming (Section~\ref{sec:system});
+(2)~a headless measurement tool that samples any island directly from the height function, with no rendering (Section~\ref{sec:method}); and
+(3)~an expressive range analysis of 998 islands, including a paired before-and-after comparison that isolates the effect of erosion (Section~\ref{sec:results}).
+
+\section{System}\label{sec:system}
+\textbf{Island placement.} The ocean is divided into 1.5\,km cells. A hash of the cell coordinates and the world seed decides whether a cell holds an island and, if so, its type, centre, radius and cliff factor. Centres stay away from cell borders, so any point needs to check only its 9 neighbouring cells. Height is therefore a pure function $h(x,z)$ evaluated in double precision: nothing is stored, the world is unbounded, and any point can be computed on any thread in any order.
+
+\textbf{Island types.} Mountain islands combine fractional Brownian motion for hills with ridged multifractal noise for ridges~\cite{ebert}, plus a wandering cliff line on part of the coast. Atolls are a ring of sand around a shallow lagoon, broken by channels. Sea stacks are clusters of steep rock pillars on a shallow shelf. Cays are small, flat sandy islets. A domain warp bends each island's circular outline into bays and headlands, and heights near sea level are compressed so beaches come out wide and flat:
+\begin{equation}
+h' = h - 0.6\, b \tanh(h/b).
+\end{equation}
+
+\textbf{Hydraulic erosion.} Mountain islands are eroded by simulated rain droplets, following Beyer's particle model~\cite{beyer}. Each droplet runs downhill with slight inertia, gains speed on steep ground, evaporates, and carries sediment up to a capacity
+\begin{equation}
+c = \max(-\Delta h,\, s_{\min}) \cdot v \cdot w \cdot k,
+\end{equation}
+where $\Delta h$ is the height change of the step, $v$ speed, $w$ water and $k$ a constant. Below capacity it erodes with a soft brush; above, it deposits. Because each droplet changes the ground for the next, erosion cannot be a pure function. It runs once per island on a $384\times384$ grid (about 100{,}000 droplets, 0.2--0.5\,s), and the resulting height change is cached and added to the base terrain. Worker threads needing the same island wait on one shared future; the cache keeps the 48 most recently used islands.
+
+\textbf{Runtime.} The renderer streams 128\,m terrain chunks on worker threads with 6 levels of detail out to about 4.6\,km, under a 3\,ms per-frame upload budget. Ocean waves are a sum of Gerstner waves~\cite{tessendorf}, evaluated identically on GPU and CPU so the boat floats on the rendered surface.
+
+\section{Method}\label{sec:method}
+\textbf{Sample.} For each of 25 seeds, every cell in an $8\times8$ block (64 cells, 144\,km$^2$) was checked for an island, giving 998 islands: 534 mountain, 178 sea-stack, 159 cay and 127 atoll. Each island was measured twice, from one generator with erosion and one without, so every erosion comparison is paired on the same island.
+
+\textbf{Sampling.} Height was sampled on a 4\,m grid over the disc of the island's radius. Points closer, relative to radius, to a neighbouring island's centre were assigned to that neighbour and skipped. The tool calls the same height function the game uses; the full run takes about 3.5 minutes on one CPU core.
+
+\textbf{Metrics.} All metrics are computed over land (samples above sea level): \emph{land area}; \emph{peak height}; \emph{mean slope} from central differences; \emph{steep share}, the fraction of land steeper than 35\textdegree; \emph{ruggedness}, the mean absolute height difference to the 8 neighbours; and \emph{coast index}, coastline length divided by the circumference of a circle of equal area (1 = round). Coastline length counts land--water cell edges, scaled by $\pi/4$ to correct the overestimate of grid edge counting.
+
+\section{Results}\label{sec:results}
+\begin{figure}[t]
+\centering\includegraphics[width=\columnwidth]{fig1_expressive_range.png}
+\caption{Land area against peak height for all 998 islands, with erosion, by type (log scales).}\label{fig:range}
+\end{figure}
+
+\begin{table}[t]
+\centering\small\setlength{\tabcolsep}{2.6pt}
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+Type & $n$ & Area (m$^2$) & Peak (m) & Slope (\textdegree) & Rugg. (m) & Coast \\
+\midrule
+Mountain & 534 & 256{,}950 & 78.6 & 23.0 & 1.55 & 1.09\\
+Sea stacks & 178 & 9{,}450 & 32.5 & 59.1 & 9.32 & 5.39\\
+Cay & 159 & 16{,}600 & 1.6 & 2.4 & 0.13 & 1.02\\
+Atoll & 127 & 34{,}500 & 1.9 & 6.7 & 0.38 & 4.28\\
+\bottomrule
+\end{tabular}
+\caption{Median of each metric by island type, with erosion.}\label{tab:types}
+\end{table}
+
+\textbf{The four island types are distinct.} Mountains and sea stacks form separate clusters in size and height (Figure~\ref{fig:range}). Cays and atolls overlap there, but not in shape: their median coast index is 1.02 versus 4.28, because an atoll is a broken ring around a lagoon (Table~\ref{tab:types}). Mountain islands span the widest range, about $24\times$ in land area and $11\times$ in peak height.
+
+\textbf{Mountain islands vary along a steepness--ruggedness axis.} Steepness and ruggedness rise together, but islands with the same share of steep land differ in ruggedness by up to about 1\,m (Figure~\ref{fig:heat}). The generator produces more than one kind of mountain island at a given steepness.
+
+\begin{figure}[t]
+\centering\includegraphics[width=0.92\columnwidth]{fig2_mountain_heatmap.png}
+\caption{Steep-land share against ruggedness for the 534 mountain islands.}\label{fig:heat}
+\end{figure}
+
+\textbf{Erosion carves valleys but keeps the summits.} Comparing each mountain island with and without erosion, mean land height falls by a median 18\% (middle half: 15--24\%) while peak height falls by only 1.8\% (Figure~\ref{fig:erosion}). Mean land height dropped on every island. Ruggedness rose on 81\% of islands (median $+9.4$\%) and steep-land share on 70\% (median $+16.9$\%). Land area grew by a median 3.2\%, consistent with sediment deposited at the coast. Erosion is also the main cost: sampling one mountain island takes a median 31\,ms raw and 263\,ms with erosion, including the one-off simulation.
+
+\begin{figure}[t]
+\centering\includegraphics[width=\columnwidth]{fig3_erosion_effect.png}
+\caption{Change after erosion on 534 mountain islands; dot = median, bar = middle 50\%.}\label{fig:erosion}
+\end{figure}
+
+\section{Discussion and limitations}
+The paired comparison shows erosion behaving as intended: it moves material from slopes into valleys and onto the coast rather than flattening the island. Near-constant peaks matter for gameplay, since summits are the landmarks a sailor navigates by. The wide spread in steep-land change (middle half: 0--54\%) suggests erosion's effect depends strongly on the base shape, which is worth modelling directly.
+
+The study has four limits. \emph{Neighbour overlap:} two atolls still pick up land from a neighbouring island, visible as the two atoll points among taller islands in Figure~\ref{fig:range}. \emph{Shape, not experience:} the metrics describe geometry; whether an island is interesting to explore would need a player study. \emph{Fixed parameters:} erosion settings were held at their defaults, so sensitivity is untested. \emph{One generator:} with no comparison to other terrain generators, the ranges are descriptive, not benchmarks.
+
+\section{Future work}
+Three directions would turn this into thesis-scale research. (1)~\emph{Controllable erosion:} sweep the erosion parameters and model how they map onto the measured metrics, so a designer can ask for ``more rugged, same peaks'' and get it. (2)~\emph{Learned island shapes:} train a model on real coastlines or heightmaps and compare its expressive range with the hand-built generator's, in the spirit of procedural content generation via machine learning~\cite{pcgml}. (3)~\emph{From shape to experience:} run a player study in SeaSail to test which measured properties predict how interesting an island is to sail around.
+
+\textbf{Code and data.} Source, the measurement tool, raw data and figure scripts: \url{https://github.com/Nimesh2099/SeaSail}. Video: \url{https://youtu.be/OqiDfUysCDo}.
+
+\small
+\begin{thebibliography}{6}\setlength{\itemsep}{1pt}
+\bibitem{smith} G.~Smith and J.~Whitehead. Analyzing the expressive range of a level generator. In \emph{Proc.\ Workshop on Procedural Content Generation in Games}, 2010.
+\bibitem{shaker} N.~Shaker, J.~Togelius and M.~J.~Nelson. \emph{Procedural Content Generation in Games}. Springer, 2016.
+\bibitem{ebert} D.~S.~Ebert, F.~K.~Musgrave, D.~Peachey, K.~Perlin and S.~Worley. \emph{Texturing and Modeling: A Procedural Approach}, 3rd ed. Morgan Kaufmann, 2003.
+\bibitem{beyer} H.~T.~Beyer. Implementation of a method for hydraulic erosion. Bachelor's thesis, Technische Universit\"at M\"unchen, 2015.
+\bibitem{tessendorf} J.~Tessendorf. Simulating ocean water. \emph{SIGGRAPH Course Notes}, 2001.
+\bibitem{pcgml} A.~Summerville, S.~Snodgrass, M.~Guzdial, C.~Holmg\aa rd, A.~K.~Hoover, A.~Isaksen, A.~Nealen and J.~Togelius. Procedural content generation via machine learning (PCGML). \emph{IEEE Trans.\ Games}, 10(3), 2018.
+\end{thebibliography}
+\end{document}
